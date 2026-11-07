@@ -9,6 +9,7 @@ import {
 } from '@/lib/types';
 import { SAMPLE_PROFILES } from '@/lib/rbi-factsheet';
 import { ScorecardView } from '@/components/ScorecardView';
+import { recordCompletedRoundQuestions } from '@/lib/question-memory';
 import { Loader2, AlertCircle, Camera } from 'lucide-react';
 
 // Fallback transcript if someone visits /report directly
@@ -199,12 +200,50 @@ export default function ReportPage() {
     runEvaluation(prof, trans, snaps);
   }, [runEvaluation]);
 
-  const handlePracticeAgain = () => {
+  const extractQuestionsFromSession = (
+    evalReport: EvaluationReport | null,
+    transcriptEntries: TranscriptEntry[]
+  ): string[] => {
+    const list: string[] = [];
+    if (evalReport?.questionByQuestion) {
+      for (const item of evalReport.questionByQuestion) {
+        if (item.question?.trim()) {
+          list.push(item.question.trim());
+        }
+      }
+    }
+    for (const entry of transcriptEntries) {
+      if (entry.speaker === 'panelist' && entry.text.includes('?')) {
+        list.push(entry.text.trim());
+      }
+    }
+    return list;
+  };
+
+  const handleRetrySameRound = () => {
     if (typeof window !== 'undefined') {
+      // Keep ibps_dossier and ibps_candidate_profile intact for exact angle retry
       sessionStorage.removeItem('ibps_evaluation_report');
       sessionStorage.removeItem('ibps_transcript');
     }
+    router.push('/room');
+  };
+
+  const handleNextRound = () => {
+    if (typeof window !== 'undefined') {
+      const questions = extractQuestionsFromSession(report, transcript);
+      if (questions.length > 0) {
+        recordCompletedRoundQuestions(questions);
+      }
+      sessionStorage.removeItem('ibps_evaluation_report');
+      sessionStorage.removeItem('ibps_transcript');
+      sessionStorage.removeItem('ibps_dossier');
+    }
     router.push('/');
+  };
+
+  const handlePracticeAgain = () => {
+    handleNextRound();
   };
 
   return (
@@ -308,6 +347,8 @@ export default function ReportPage() {
           profile={profile}
           transcript={transcript}
           onPracticeAgain={handlePracticeAgain}
+          onRetrySameRound={handleRetrySameRound}
+          onNextRound={handleNextRound}
         />
       )}
     </div>

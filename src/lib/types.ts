@@ -44,6 +44,14 @@ export interface PreInterviewDossier {
   degreeCrossQuestions: string[];
   currentBankingTopics: string[];
   rbiQuickRef: string;
+  roundNumber?: number;
+  avoidedQuestions?: string[];
+  seatAngles?: {
+    seat1: string;
+    seat2: string;
+    seat3: string;
+    seat4: string;
+  };
 }
 
 export interface EvaluationReport {

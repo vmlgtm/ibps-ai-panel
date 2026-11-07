@@ -5,6 +5,7 @@ import { CandidateProfile, EvaluationReport, TranscriptEntry } from '@/lib/types
 import {
   Printer,
   ArrowRight,
+  RotateCcw,
   ChevronDown,
   ChevronUp,
   CheckCircle2,
@@ -19,7 +20,9 @@ interface ScorecardViewProps {
   report: EvaluationReport;
   profile: CandidateProfile;
   transcript: TranscriptEntry[];
-  onPracticeAgain: () => void;
+  onPracticeAgain?: () => void;
+  onRetrySameRound?: () => void;
+  onNextRound?: () => void;
 }
 
 export function ScorecardView({
@@ -27,6 +30,8 @@ export function ScorecardView({
   profile,
   transcript,
   onPracticeAgain,
+  onRetrySameRound,
+  onNextRound,
 }: ScorecardViewProps) {
   // Segmented toggle for right column: 'debrief' (default) vs 'transcript'
   const [rightView, setRightView] = useState<'debrief' | 'transcript'>('debrief');
@@ -197,16 +202,27 @@ export function ScorecardView({
               type="button"
               onClick={handlePrint}
               className="px-3 py-2 rounded-lg border border-zinc-800 bg-zinc-900/60 hover:bg-zinc-800 hover:border-zinc-700 text-zinc-300 text-xs transition-colors flex items-center gap-1.5 cursor-pointer"
+              title="Print official merit evaluation scorecard"
             >
               <Printer className="w-3.5 h-3.5 text-zinc-400" strokeWidth={1.5} />
               <span className="hidden sm:inline">Print</span>
             </button>
             <button
               type="button"
-              onClick={onPracticeAgain}
-              className="px-3.5 py-2 rounded-lg bg-[#E5B869] hover:bg-[#ecd094] text-zinc-950 font-semibold text-xs transition-colors flex items-center gap-1.5 cursor-pointer shadow-[0_0_20px_rgba(229,184,105,0.2)] active:scale-[0.99]"
+              onClick={onRetrySameRound || onPracticeAgain}
+              className="px-3 py-2 rounded-lg border border-zinc-800 bg-zinc-900/70 hover:bg-zinc-800 hover:border-zinc-700 text-zinc-300 text-xs transition-colors flex items-center gap-1.5 cursor-pointer active:scale-[0.99]"
+              title="Retry this exact round keeping the current interview dossier"
             >
-              <span>Practice again</span>
+              <RotateCcw className="w-3.5 h-3.5 text-zinc-400" strokeWidth={1.5} />
+              <span className="hidden sm:inline">Retry Same Round</span>
+            </button>
+            <button
+              type="button"
+              onClick={onNextRound || onPracticeAgain}
+              className="px-3.5 py-2 rounded-lg bg-[#E5B869] hover:bg-[#ecd094] text-zinc-950 font-semibold text-xs transition-colors flex items-center gap-1.5 cursor-pointer shadow-[0_0_20px_rgba(229,184,105,0.2)] active:scale-[0.99]"
+              title="Save questions to exclusion memory and start next round with fresh angles"
+            >
+              <span>Next Round (Fresh Questions)</span>
               <ArrowRight className="w-3.5 h-3.5" strokeWidth={1.5} />
             </button>
           </div>

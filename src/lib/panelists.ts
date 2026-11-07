@@ -74,6 +74,18 @@ export function buildPanelistSystemPrompt(
   const isFinalPanelist = seat === 4;
   const nextPanelist = !isFinalPanelist ? PANELISTS_BY_SEAT[(seat + 1) as PanelSeatId] : null;
 
+  const assignedAngle =
+    dossier.seatAngles && dossier.seatAngles[`seat${seat}` as keyof typeof dossier.seatAngles]
+      ? dossier.seatAngles[`seat${seat}` as keyof typeof dossier.seatAngles]
+      : null;
+
+  const avoidedQuestionsBlock =
+    dossier.avoidedQuestions && dossier.avoidedQuestions.length > 0
+      ? `\n### PAST QUESTIONS ALREADY ASKED TO THIS CANDIDATE IN PREVIOUS ROUNDS (DO NOT REPEAT THESE QUESTIONS; ASK FRESH ONES):\n${dossier.avoidedQuestions
+          .map((q, idx) => `${idx + 1}. ${q}`)
+          .join('\n')}\n`
+      : '';
+
   // Summarize prior transcript context for continuity
   const priorTurns = transcriptSoFar
     .slice(-10)
@@ -108,9 +120,9 @@ You are sitting at Seat ${seat} of an elite 4-member interview panel conducting 
 - Degree Cross-Question Hooks: ${dossier.degreeCrossQuestions.slice(0, 3).join('; ') || 'Transition to banking rationale'}
 - Current Banking & Macro Topics: ${dossier.currentBankingTopics.slice(0, 3).join('; ') || 'Financial inclusion & digital payments'}
 - Regulatory Benchmark: ${dossier.rbiQuickRef}
-
+${avoidedQuestionsBlock}
 ### YOUR SPECIFIC SEAT RESPONSIBILITIES (Seat ${seat}):
-${
+${assignedAngle ? `- **ASSIGNED FOCUS ANGLE FOR THIS ROUND:** ${assignedAngle}\n` : ''}${
   seat === 1
     ? `- Welcome the candidate warmly. Help them settle down if this is the start.
 - Focus on personal profile: educational background, hometown, reasons for choosing a banking career over ${profile.stream}, and addressing any career gap or transition from prior work (${profile.gapOrWorkDetails}).

@@ -2,11 +2,14 @@ import { NextResponse } from 'next/server';
 import { extractApiKeyFromRequest, getGeminiClient } from '@/lib/gemini-server';
 import { CandidateProfile, PreInterviewDossier } from '@/lib/types';
 import { RBI_FACTSHEET_SUMMARY } from '@/lib/rbi-factsheet';
+import { pickSessionAngles } from '@/lib/question-memory';
 
 interface DossierRequestBody {
   action?: 'generate_dossier' | 'parse_resume';
   profile?: CandidateProfile;
   resumeText?: string;
+  pastQuestions?: string[];
+  roundNumber?: number;
 }
 
 function cleanJsonString(raw: string): string {
@@ -82,6 +85,22 @@ ${body.resumeText.slice(0, 10000)}
       return NextResponse.json({ error: 'Candidate profile is required' }, { status: 400 });
     }
 
+    const roundNumber =
+      typeof body.roundNumber === 'number' && body.roundNumber > 0 ? body.roundNumber : 1;
+    const pastQuestions = Array.isArray(body.pastQuestions)
+      ? body.pastQuestions.filter((q) => typeof q === 'string' && q.trim().length > 0)
+      : [];
+    const seatAngles = pickSessionAngles(roundNumber);
+    const temperature = roundNumber > 1 ? 0.65 : 0.3;
+
+    const pastQuestionsBlock =
+      pastQuestions.length > 0
+        ? `\nPREVIOUSLY ASKED QUESTIONS IN PAST SESSIONS (STRICTLY DO NOT REPEAT THESE; GENERATE COMPLETELY FRESH ANGLES):\n${pastQuestions
+            .slice(-15)
+            .map((q, idx) => `${idx + 1}. ${q}`)
+            .join('\n')}\n`
+        : '';
+
     const dossierPrompt = `
 You are the Chief Interview Coordinator for the IBPS / SBI PO Interview Board.
 Prepare a sharp, grounded Pre-Interview Briefing Dossier for the 4-member expert panel
@@ -94,7 +113,8 @@ Career Status: ${profile.careerStatus} (${profile.gapOrWorkDetails})
 Hobbies & Interests: ${profile.hobbies}
 Target Examination: ${profile.targetExam}
 Resume Highlights: ${profile.resumeHighlights || 'None specified'}
-
+Round Number: ${roundNumber}
+${pastQuestionsBlock}
 Generate the dossier in STRICT JSON format with NO markdown wrapping, matching this exact structure:
 {
   "hometownFacts": [
@@ -120,7 +140,7 @@ Ensure all facts are authentic, accurate, and directly usable by veteran Indian 
         contents: dossierPrompt,
         config: {
           tools: [{ googleSearch: {} }],
-          temperature: 0.3,
+          temperature,
         },
       });
       rawText = groundedResponse.text || null;
@@ -138,7 +158,7 @@ Ensure all facts are authentic, accurate, and directly usable by veteran Indian 
         contents: dossierPrompt,
         config: {
           responseMimeType: 'application/json',
-          temperature: 0.3,
+          temperature,
         },
       });
       rawText = fallbackResponse.text || '{}';
@@ -185,6 +205,9 @@ Ensure all facts are authentic, accurate, and directly usable by veteran Indian 
             'Priority Sector Lending (PSL) targets: 40% ANBC, including 18% agriculture and 7.5% micro-enterprises.',
           ],
       rbiQuickRef: RBI_FACTSHEET_SUMMARY,
+      roundNumber,
+      avoidedQuestions: pastQuestions.slice(-15),
+      seatAngles,
     };
 
     return NextResponse.json({

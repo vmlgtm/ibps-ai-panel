@@ -10,6 +10,11 @@ import {
   SAMPLE_PROFILES,
 } from '@/lib/rbi-factsheet';
 import {
+  getQuestionHistory,
+  resetQuestionHistory,
+  QuestionHistory,
+} from '@/lib/question-memory';
+import {
   Key,
   BookOpen,
   ArrowRight,
@@ -67,13 +72,26 @@ export default function HomePage() {
   const [preparationStep, setPreparationStep] = useState<string>('');
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
-  // Load custom key from localStorage on mount
+  // Question Memory & Round Rotation State
+  const [questionHistory, setQuestionHistory] = useState<QuestionHistory>({
+    roundCount: 1,
+    pastQuestions: [],
+  });
+
+  // Load custom key and past question history from localStorage on mount
   useEffect(() => {
     const savedKey = localStorage.getItem('ibps_gemini_api_key');
     if (savedKey) {
       setGeminiApiKey(savedKey);
     }
+    const history = getQuestionHistory();
+    setQuestionHistory(history);
   }, []);
+
+  const handleResetMemory = () => {
+    resetQuestionHistory();
+    setQuestionHistory({ roundCount: 1, pastQuestions: [] });
+  };
 
   const handleSaveApiKey = () => {
     if (geminiApiKey.trim()) {
@@ -168,6 +186,8 @@ export default function HomePage() {
         body: JSON.stringify({
           action: 'generate_dossier',
           profile,
+          pastQuestions: questionHistory.pastQuestions,
+          roundNumber: questionHistory.roundCount,
         }),
       });
 
@@ -720,6 +740,26 @@ export default function HomePage() {
               <div className="p-3 rounded-lg bg-rose-950/40 border border-rose-800/60 text-xs text-rose-300 flex items-center gap-2">
                 <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" strokeWidth={1.5} />
                 <span>{errorMessage}</span>
+              </div>
+            )}
+
+            {/* Smart Round Memory & Past-Question Exclusion Status Bar */}
+            {questionHistory.pastQuestions.length > 0 && (
+              <div className="flex items-center justify-between px-3.5 py-2.5 rounded-lg bg-zinc-900/70 border border-[#E5B869]/20 text-xs text-zinc-400">
+                <div className="flex items-center gap-2">
+                  <span className="w-1.5 h-1.5 rounded-full bg-[#E5B869] shadow-[0_0_8px_rgba(229,184,105,0.6)]" />
+                  <span>
+                    <strong className="text-zinc-200 font-medium">Round #{questionHistory.roundCount}</strong> ·{' '}
+                    {questionHistory.pastQuestions.length} past questions avoided (fresh panel angles active)
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  onClick={handleResetMemory}
+                  className="text-[11px] text-zinc-400 hover:text-[#E5B869] font-mono underline underline-offset-2 transition-colors cursor-pointer"
+                >
+                  [Reset memory]
+                </button>
               </div>
             )}
 

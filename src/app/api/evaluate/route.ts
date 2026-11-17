@@ -17,13 +17,27 @@ interface InterviewExchange {
   candidateVerbatimAnswer: string;
 }
 
+function isHandoverOrClosingRemark(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed) return true;
+  const hasHandoverPhrase =
+    /\b(take over|pass(?:ing)? (?:the )?(?:mic|baton|floor)|hand(?:ing)? over|over to (?:you|shri|dr|mr|ms|mrs|seat)|that(?:'s| will be) all from (?:my|our) side|leave the room|all the best|interview (?:is )?(?:now )?concluded|would you like to take)\b/i.test(
+      trimmed
+    );
+  return hasHandoverPhrase || !trimmed.includes('?');
+}
+
 function buildStructuredExchanges(transcript: TranscriptEntry[]): InterviewExchange[] {
   const exchanges: InterviewExchange[] = [];
   let current: InterviewExchange | null = null;
 
   for (const entry of transcript) {
     const text = (entry.text || '').trim();
-    if (!text || entry.speaker === 'system') continue;
+    if (!text) continue;
+    if (entry.speaker === 'system') {
+      current = null;
+      continue;
+    }
 
     if (entry.speaker === 'panelist') {
       if (
@@ -57,11 +71,21 @@ function buildStructuredExchanges(transcript: TranscriptEntry[]): InterviewExcha
     }
   }
 
+  const answeredKeys = new Set<string>();
   for (const ex of exchanges) {
     ex.candidateVerbatimAnswer = ex.candidateParts.join(' ').trim();
+    if (ex.candidateVerbatimAnswer.length > 0) {
+      answeredKeys.add(`${ex.seat ?? ''}:${ex.askedBy}`);
+    }
   }
 
-  return exchanges;
+  return exchanges.filter((ex) => {
+    if (ex.candidateVerbatimAnswer.length > 0) return true;
+    const seatKey = `${ex.seat ?? ''}:${ex.askedBy}`;
+    if (answeredKeys.has(seatKey)) return false;
+    if (isHandoverOrClosingRemark(ex.questionText)) return false;
+    return true;
+  });
 }
 
 function computeVerdict(score: number): EvaluationReport['verdict'] {

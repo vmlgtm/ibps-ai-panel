@@ -396,7 +396,8 @@ export class PanelBoardLiveController {
     this.setStatus('speaking');
     this.sendAudioStreamEndOnce();
 
-    if (!this.sendClientTurnText(cleanText)) {
+    const turnPrompt = this.appendQuotaCompleteHintIfReady(cleanText);
+    if (!this.sendClientTurnText(turnPrompt)) {
       this.enterListeningState();
       this.callbacks.onError?.(new Error('Failed to send text input to Live session.'));
       return;
@@ -488,10 +489,10 @@ export class PanelBoardLiveController {
         ).trim();
         this.flushCandidateTranscript();
         const combinedSpoken = lateSpoken || spoken;
-        const promptText = combinedSpoken
+        const basePromptText = combinedSpoken
           ? `[Candidate finished answering: "${combinedSpoken}"]`
           : '[Candidate has finished speaking. Please respond to their answer and ask your next question.]';
-        this.sendClientTurnText(promptText);
+        this.sendClientTurnText(this.appendQuotaCompleteHintIfReady(basePromptText));
       }, 1200);
     } else {
       // User pressed the button without speaking (panelist stopped mid-way or stalled)
@@ -910,7 +911,7 @@ export class PanelBoardLiveController {
             {
               name: 'hand_over_to_next_panelist',
               description:
-                'Pass the interview turn to the next board member (Seat 1 to 4). Call this when you have completed your quota of questions.',
+                'Pass the interview turn to the next board member (Seat 1 to 4). Call this ONLY AFTER the candidate has finished answering all of your questions. NEVER call this in the same turn that you ask a question.',
               parameters: {
                 type: Type.OBJECT,
                 properties: {
@@ -929,7 +930,7 @@ export class PanelBoardLiveController {
             {
               name: 'complete_interview',
               description:
-                'Formally conclude the 4-member interview panel when all board members have finished their questions.',
+                'Formally conclude the 4-member interview panel. Call this ONLY AFTER the candidate has finished answering all of your questions. NEVER call this in the same turn that you ask a question.',
               parameters: {
                 type: Type.OBJECT,
                 properties: {
@@ -1132,6 +1133,14 @@ export class PanelBoardLiveController {
         // Finalize candidate speech if pending
         this.flushCandidateTranscript();
 
+        let lastNonSystemBeforePanelist: TranscriptEntry | undefined;
+        for (let i = this.transcript.length - 1; i >= 0; i--) {
+          if (this.transcript[i].speaker !== 'system') {
+            lastNonSystemBeforePanelist = this.transcript[i];
+            break;
+          }
+        }
+
         const completedPanelistText = this.currentPanelistChunkText.trim();
         if (completedPanelistText) {
           const panelist = PANELISTS_BY_SEAT[this.activeSeat];
@@ -1142,6 +1151,23 @@ export class PanelBoardLiveController {
             text: completedPanelistText,
           });
           this.currentPanelistChunkText = '';
+        }
+
+        const answersCount = this.getCandidateAnswersCountForActiveSeat();
+        const quota = this.getQuestionQuota();
+        if (
+          answersCount >= quota &&
+          lastNonSystemBeforePanelist?.speaker === 'candidate' &&
+          this.pendingHandoffSeat === null &&
+          this.pendingInterviewComplete === null
+        ) {
+          if (this.activeSeat < 4) {
+            this.scheduleHandoff((this.activeSeat + 1) as PanelSeatId);
+          } else {
+            this.scheduleInterviewCompletion(
+              completedPanelistText || 'Interview board concluded.'
+            );
+          }
         }
 
         const isPendingTransition =
@@ -1174,6 +1200,35 @@ export class PanelBoardLiveController {
     const callId = call.id || 'tool-call-1';
     const functionName = call.name;
     const args = (call.args || {}) as Record<string, unknown>;
+
+    if (
+      functionName === 'hand_over_to_next_panelist' ||
+      functionName === 'complete_interview'
+    ) {
+      const answersCount = this.getCandidateAnswersCountForActiveSeat();
+      const quota = this.getQuestionQuota();
+      if (answersCount < quota) {
+        try {
+          this.activeSession?.sendToolResponse({
+            functionResponses: [
+              {
+                id: callId,
+                name: functionName,
+                response: {
+                  output: {
+                    status: 'deferred_wait_for_candidate_answer',
+                    message: `Do NOT hand over yet. The candidate has only answered ${answersCount} of ${quota} questions. Wait for the candidate to answer your current question first.`,
+                  },
+                },
+              },
+            ],
+          });
+        } catch (err) {
+          console.warn('Failed to send deferred tool response:', err);
+        }
+        return;
+      }
+    }
 
     if (functionName === 'hand_over_to_next_panelist') {
       const nextSeatNum = Number(args.nextSeat);
@@ -1310,12 +1365,44 @@ export class PanelBoardLiveController {
       this.setStatus('speaking');
     }
 
-    const promptText =
+    const basePromptText =
       reason === 'auto-filler'
         ? '[SYSTEM: Your previous turn was only a brief acknowledgment without a complete question. Immediately continue speaking and ask your complete interview question (or call the handoff tool if your quota is done). Speak with an authentic Indian English accent (never an American accent).]'
         : '[SYSTEM: Please continue and state your complete interview question clearly to the candidate now. Speak with an authentic Indian English accent (never an American accent).]';
 
+    const promptText =
+      reason === 'manual-nudge'
+        ? this.appendQuotaCompleteHintIfReady(basePromptText)
+        : basePromptText;
+
     this.sendClientTurnText(promptText);
+  }
+
+  private getQuestionQuota(): number {
+    return this.profile.sessionMode === 'quick' ? 2 : 3;
+  }
+
+  private getCandidateAnswersCountForActiveSeat(): number {
+    let count = 0;
+    for (let i = this.transcript.length - 1; i >= 0; i--) {
+      const entry = this.transcript[i];
+      if (entry.speaker === 'system') break;
+      if (entry.speaker === 'candidate') {
+        count++;
+      }
+    }
+    return count;
+  }
+
+  private appendQuotaCompleteHintIfReady(text: string): string {
+    const answersCount = this.getCandidateAnswersCountForActiveSeat();
+    const quota = this.getQuestionQuota();
+    if (answersCount < quota) return text;
+
+    if (this.activeSeat < 4) {
+      return `${text}\n[SYSTEM: The candidate has now answered all ${quota} of your questions for Seat ${this.activeSeat}. Give only a brief 1-sentence acknowledgment and handover remark (do NOT ask any new question) and call hand_over_to_next_panelist with nextSeat=${this.activeSeat + 1}.]`;
+    }
+    return `${text}\n[SYSTEM: The candidate has now answered all ${quota} of your questions for Seat 4. Give a brief 1-sentence closing remark (do NOT ask any new question) and call complete_interview.]`;
   }
 
   private armResponseWatchdog(): void {
@@ -1566,6 +1653,16 @@ export class PanelBoardLiveController {
   }
 
   private addTranscriptEntry(entry: Omit<TranscriptEntry, 'id' | 'timestamp'>): void {
+    if (entry.speaker === 'candidate' && this.transcript.length > 0) {
+      const lastEntry = this.transcript[this.transcript.length - 1];
+      if (lastEntry.speaker === 'candidate') {
+        lastEntry.text = `${lastEntry.text} ${entry.text}`.trim();
+        lastEntry.timestamp = Date.now();
+        this.callbacks.onTranscriptUpdate?.([...this.transcript], undefined);
+        return;
+      }
+    }
+
     const newEntry: TranscriptEntry = {
       ...entry,
       id: `trn-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,

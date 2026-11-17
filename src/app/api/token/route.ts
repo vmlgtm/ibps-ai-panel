@@ -2,11 +2,11 @@ import { NextResponse } from 'next/server';
 import { extractApiKeyFromRequest, resolveApiKey } from '@/lib/gemini-server';
 import { GoogleGenAI } from '@google/genai';
 
-const DEFAULT_LIVE_MODEL = 'gemini-2.5-flash-native-audio-preview-12-2025';
+const DEFAULT_LIVE_MODEL = 'gemini-3.8-live';
 const PREFERRED_LIVE_MODELS = [
+  'gemini-3.8-live',
   'gemini-2.5-flash-native-audio-preview-12-2025',
   'gemini-2.5-flash-native-audio-preview-09-2025',
-  'gemini-3.8-live',
   'gemini-3.1-flash-live-preview',
   'gemini-2.0-flash-live-001',
   'gemini-2.0-flash-exp',

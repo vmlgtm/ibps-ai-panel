@@ -54,9 +54,9 @@ export interface PanelBoardLiveControllerOptions {
   callbacks?: PanelBoardControllerCallbacks;
 }
 
-const DEFAULT_LIVE_MODEL = 'gemini-3.8-live';
+const DEFAULT_LIVE_MODEL = 'gemini-2.5-flash-native-audio-preview-12-2025';
 const FALLBACK_MODELS = [
-  'gemini-2.5-flash-native-audio-preview-12-2025',
+  'gemini-3.8-live',
   'gemini-3.1-flash-live-preview',
   'gemini-2.0-flash-live-001',
   'gemini-2.0-flash-exp',
@@ -1010,12 +1010,12 @@ export class PanelBoardLiveController {
 
     let kickoffMessage = '';
     if (isResume) {
-      kickoffMessage = `[SYSTEM EVENT: Brief connection refresh completed for ${panelist.name} (Seat ${seat}). Continue the interview smoothly from the recent conversation context without repeating already-asked questions. State your next complete question or follow-up now.]`;
+      kickoffMessage = `[SYSTEM EVENT: Brief connection refresh completed for ${panelist.name} (Seat ${seat}). Continue the interview smoothly from the recent conversation context without repeating already-asked questions. State your next complete question or follow-up now. Speak with an authentic Indian English accent (never an American accent).]`;
     } else if (seat === 1) {
-      kickoffMessage = `[SYSTEM EVENT: Candidate ${this.profile.name} has entered the interview room and taken a seat. Greet them warmly as Chairman Shri R.K. Deshmukh, put them at ease, and ask your first question regarding their personal profile and graduation background.]`;
+      kickoffMessage = `[SYSTEM EVENT: Candidate ${this.profile.name} has entered the interview room and taken a seat. Greet them warmly as Chairman Shri R.K. Deshmukh, put them at ease, and ask your first question regarding their personal profile and graduation background. Speak with an authentic Indian English accent (never an American accent).]`;
     } else {
       const prevPanelist = PANELISTS_BY_SEAT[((seat - 1) as PanelSeatId) || 1];
-      kickoffMessage = `[SYSTEM EVENT: ${prevPanelist.name} (Seat ${prevPanelist.seat}) has completed their turn and passed the microphone to you (${panelist.name}, Seat ${seat}). Briefly acknowledge the handover and ask your first targeted question in your focus area.]`;
+      kickoffMessage = `[SYSTEM EVENT: ${prevPanelist.name} (Seat ${prevPanelist.seat}) has completed their turn and passed the microphone to you (${panelist.name}, Seat ${seat}). Briefly acknowledge the handover and ask your first targeted question in your focus area. Speak with an authentic Indian English accent (never an American accent).]`;
     }
 
     this.isAwaitingPanelistResponse = true;
@@ -1311,8 +1311,8 @@ export class PanelBoardLiveController {
 
     const promptText =
       reason === 'auto-filler'
-        ? '[SYSTEM: Your previous turn was only a brief acknowledgment without a complete question. Immediately continue speaking and ask your complete interview question (or call the handoff tool if your quota is done).]'
-        : '[SYSTEM: Please continue and state your complete interview question clearly to the candidate now.]';
+        ? '[SYSTEM: Your previous turn was only a brief acknowledgment without a complete question. Immediately continue speaking and ask your complete interview question (or call the handoff tool if your quota is done). Speak with an authentic Indian English accent (never an American accent).]'
+        : '[SYSTEM: Please continue and state your complete interview question clearly to the candidate now. Speak with an authentic Indian English accent (never an American accent).]';
 
     this.sendClientTurnText(promptText);
   }

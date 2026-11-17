@@ -121,6 +121,10 @@ export function PanelistCard({
     statusText = 'Speaking to candidate...';
     dotColor = 'bg-emerald-400';
     dotPulse = true;
+  } else if (isActive && status === 'speaking') {
+    statusText = 'Panelist is thinking...';
+    dotColor = 'bg-amber-400';
+    dotPulse = true;
   } else if (isActive && (status === 'connected' || status === 'listening')) {
     statusText = 'Listening to your answer...';
     dotColor = 'bg-sky-400';
@@ -369,7 +373,11 @@ export function PanelistCard({
               <span className="px-1.5 py-0.5 rounded bg-zinc-950/90 border border-[#E5B869]/40 font-mono text-[10px] font-semibold text-[#F7E3B5] shadow-inner">
                 Space
               </span>
-              <span className="font-medium">Press Space or click when done speaking</span>
+              <span className="font-medium">
+                {status === 'speaking'
+                  ? 'Nudge panelist to continue'
+                  : 'Press Space or click when done speaking'}
+              </span>
               <CornerDownLeft className="w-3.5 h-3.5 text-[#E5B869] group-hover/done:translate-x-0.5 transition-transform" />
             </button>
           </div>

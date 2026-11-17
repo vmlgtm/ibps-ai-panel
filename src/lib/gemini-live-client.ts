@@ -1,8 +1,11 @@
 import {
+  ActivityHandling,
+  EndSensitivity,
   GoogleGenAI,
-  Session,
   LiveServerMessage,
   Modality,
+  Session,
+  StartSensitivity,
   Type,
 } from '@google/genai';
 import {
@@ -51,11 +54,12 @@ export interface PanelBoardLiveControllerOptions {
   callbacks?: PanelBoardControllerCallbacks;
 }
 
-const DEFAULT_LIVE_MODEL = 'gemini-2.5-flash-native-audio-preview-12-2025';
+const DEFAULT_LIVE_MODEL = 'gemini-3.8-live';
 const FALLBACK_MODELS = [
+  'gemini-2.5-flash-native-audio-preview-12-2025',
+  'gemini-3.1-flash-live-preview',
   'gemini-2.0-flash-live-001',
   'gemini-2.0-flash-exp',
-  'gemini-3.8-live',
 ];
 
 /**
@@ -156,10 +160,24 @@ export class PanelBoardLiveController {
   private transcript: TranscriptEntry[] = [];
   private currentPanelistChunkText: string = '';
   private currentCandidateChunkText: string = '';
-  private consecutiveLoudFramesWhilePanelistSpeaking: number = 0;
   private finishTurnWatchdogTimer: ReturnType<typeof setTimeout> | null = null;
+  private hybridVadFallbackTimer: ReturnType<typeof setTimeout> | null = null;
   private isDestroyed = false;
   private isMicMuted = false;
+
+  // Turn & Half-Duplex State Machine
+  private isAwaitingPanelistResponse = false;
+  private isModelGenerating = false;
+  private panelistPlaybackEndedAt = 0;
+  private hasStreamedCandidateAudioInTurn = false;
+  private hasCandidateVoiceActivityInTurn = false;
+  private consecutiveShortFillerAutoNudges = 0;
+  private pendingAutoContinuationReason: 'auto-filler' | null = null;
+  private toolCalledInCurrentTurn = false;
+  private isIntentionallyClosing = false;
+  private isReconnecting = false;
+  private reconnectAttempts = 0;
+  private lastTurnSignalSentAt = 0;
 
   // Live Session
   private aiClient: GoogleGenAI;
@@ -236,6 +254,7 @@ export class PanelBoardLiveController {
 
     try {
       this.setStatus('connecting');
+      this.isAwaitingPanelistResponse = true;
 
       // 1. Initialize browser audio contexts and mic capture
       await this.initAudioPipeline();
@@ -244,6 +263,7 @@ export class PanelBoardLiveController {
       await this.connectToSeat(this.activeSeat);
       playJoinChime();
     } catch (err) {
+      this.isAwaitingPanelistResponse = false;
       this.setStatus('error');
       const error = err instanceof Error ? err : new Error(String(err));
       this.callbacks.onError?.(error);
@@ -256,8 +276,10 @@ export class PanelBoardLiveController {
    */
   public async disconnect(): Promise<void> {
     this.isDestroyed = true;
+    this.isIntentionallyClosing = true;
     this.clearPendingHandoffTimer();
     this.clearFinishTurnWatchdog();
+    this.clearHybridVadFallbackTimer();
 
     // Close Gemini Live session
     if (this.activeSession) {
@@ -330,7 +352,14 @@ export class PanelBoardLiveController {
 
     this.stopPlaybackQueue();
     this.clearPendingHandoffTimer();
+    this.clearFinishTurnWatchdog();
+    this.clearHybridVadFallbackTimer();
     this.pendingHandoffSeat = null;
+    this.pendingInterviewComplete = null;
+    this.pendingAutoContinuationReason = null;
+    this.consecutiveShortFillerAutoNudges = 0;
+    this.isModelGenerating = false;
+    this.isAwaitingPanelistResponse = true;
 
     await this.performHandoff(targetSeat);
   }
@@ -341,7 +370,14 @@ export class PanelBoardLiveController {
    */
   public sendCandidateText(text: string): void {
     const cleanText = text.trim();
-    if (!cleanText || !this.activeSession) return;
+    if (!cleanText || !this.activeSession || this.isDestroyed) return;
+
+    this.clearFinishTurnWatchdog();
+    this.clearHybridVadFallbackTimer();
+    this.currentCandidateChunkText = '';
+    this.hasCandidateVoiceActivityInTurn = false;
+    this.consecutiveShortFillerAutoNudges = 0;
+    this.pendingAutoContinuationReason = null;
 
     // Append to transcript
     this.addTranscriptEntry({
@@ -350,30 +386,18 @@ export class PanelBoardLiveController {
       text: cleanText,
     });
 
-    // Send client content turn to trigger immediate spoken response
-    try {
-      this.activeSession.sendClientContent({
-        turns: [
-          {
-            role: 'user',
-            parts: [{ text: cleanText }],
-          },
-        ],
-        turnComplete: true,
-      });
-    } catch (err) {
-      console.warn('Failed to send candidate text via sendClientContent, falling back to sendRealtimeInput:', err);
-      try {
-        this.activeSession.sendRealtimeInput({
-          text: cleanText,
-        });
-      } catch (fallbackErr) {
-        console.error('Failed to send text input to Live session:', fallbackErr);
-        this.callbacks.onError?.(
-          fallbackErr instanceof Error ? fallbackErr : new Error(String(fallbackErr))
-        );
-      }
+    // Gate mic and transition to speaking while panelist responds
+    this.isAwaitingPanelistResponse = true;
+    this.setStatus('speaking');
+    this.sendAudioStreamEndOnce();
+
+    if (!this.sendClientTurnText(cleanText)) {
+      this.enterListeningState();
+      this.callbacks.onError?.(new Error('Failed to send text input to Live session.'));
+      return;
     }
+
+    this.armResponseWatchdog();
   }
 
   /**
@@ -384,9 +408,7 @@ export class PanelBoardLiveController {
     playToggleClick(!muted);
     if (muted) {
       this.callbacks.onAudioLevel?.('candidate', 0);
-      try {
-        this.activeSession?.sendRealtimeInput({ audioStreamEnd: true });
-      } catch {}
+      this.sendAudioStreamEndOnce();
     }
   }
 
@@ -394,82 +416,79 @@ export class PanelBoardLiveController {
    * Manually trigger barge-in/interruption (clears queued panelist audio immediately).
    */
   public interrupt(): void {
-    this.handleInterruption();
+    this.handleInterruption(true);
   }
 
   /**
    * "Done Speaking / Nudge Panel":
    * When the candidate finishes speaking (or presses Space / clicks Done Speaking),
-   * flushes any live candidate transcription and immediately prompts Gemini Live
-   * to take the floor and reply without waiting for silence timeouts.
+   * flushes candidate audio with Hybrid VAD (`audioStreamEnd`), gates the mic, and
+   * ensures Gemini Live takes the floor without cutting off an active response.
    */
   public finishCandidateTurn(): void {
     if (!this.activeSession || this.isDestroyed) return;
 
+    // Ensure browser audio contexts remain unlocked on user gesture
+    if (this.playbackContext?.state === 'suspended') {
+      void this.playbackContext.resume().catch(() => {});
+    }
+    if (this.micContext?.state === 'suspended') {
+      void this.micContext.resume().catch(() => {});
+    }
+
+    // Do not interrupt a panelist who is already generating or playing audio
+    if (this.isModelGenerating || this.scheduledSources.length > 0) {
+      return;
+    }
+
+    // Debounce accidental double-taps while a turn signal is already in flight
+    if (this.isAwaitingPanelistResponse && Date.now() - this.lastTurnSignalSentAt < 1500) {
+      return;
+    }
+
+    this.lastTurnSignalSentAt = Date.now();
     this.clearFinishTurnWatchdog();
+    this.clearHybridVadFallbackTimer();
     playDoneSpeakingPop();
 
     // 1. Capture any accumulated candidate transcription
     const spoken = this.currentCandidateChunkText.trim();
-    if (spoken.length > 0) {
-      this.addTranscriptEntry({
-        speaker: 'candidate',
-        speakerName: this.profile.name,
-        text: spoken,
-      });
-      this.currentCandidateChunkText = '';
-      this.callbacks.onTranscriptUpdate?.(this.transcript, undefined);
-    }
+    const candidateSpoke = spoken.length > 0 || this.hasCandidateVoiceActivityInTurn;
+    this.flushCandidateTranscript();
 
-    // 2. Immediately signal Gemini Live to respond now
-    try {
-      this.activeSession.sendClientContent({
-        turns: [
-          {
-            role: 'user',
-            parts: [{ text: spoken ? '[Candidate finished speaking]' : 'Please proceed.' }],
-          },
-        ],
-        turnComplete: true,
-      });
-    } catch (err) {
-      console.warn('Failed to send finish turn signal via sendClientContent, trying fallback:', err);
-      try {
-        this.activeSession.sendRealtimeInput({
-          text: spoken ? '[Candidate finished speaking]' : 'Please proceed.',
-        });
-      } catch (fallbackErr) {
-        console.warn('Failed to send fallback finish candidate turn text:', fallbackErr);
-      }
-    }
+    // 2. Gate mic immediately and flush server VAD buffer cleanly
+    this.isAwaitingPanelistResponse = true;
+    this.hasCandidateVoiceActivityInTurn = false;
+    this.pendingAutoContinuationReason = null;
+    this.setStatus('speaking');
+    this.sendAudioStreamEndOnce();
 
-    // 3. Fallback watchdog: if model audio/turn does not arrive within 1.8 seconds, nudge panelist explicitly
-    const initialSourcesCount = this.scheduledSources.length;
-    this.finishTurnWatchdogTimer = setTimeout(() => {
-      this.finishTurnWatchdogTimer = null;
-      if (this.isDestroyed || !this.activeSession) return;
-
-      if (this.scheduledSources.length === initialSourcesCount && !this.currentPanelistChunkText.trim()) {
-        console.log('Watchdog: Panelist silent after candidate turn, sending nudge prompt.');
-        try {
-          this.activeSession.sendClientContent({
-            turns: [
-              {
-                role: 'user',
-                parts: [
-                  {
-                    text: '[SYSTEM: Candidate has finished their response. Please respond or ask your next question.]',
-                  },
-                ],
-              },
-            ],
-            turnComplete: true,
-          });
-        } catch (watchdogErr) {
-          console.warn('Watchdog nudge failed:', watchdogErr);
+    // 3. Coordinate Hybrid VAD vs direct continuation
+    if (candidateSpoke) {
+      // Give automatic/hybrid VAD 1200ms to respond before sending explicit clientContent
+      this.hybridVadFallbackTimer = setTimeout(() => {
+        this.hybridVadFallbackTimer = null;
+        if (
+          this.isDestroyed ||
+          !this.activeSession ||
+          this.isModelGenerating ||
+          this.scheduledSources.length > 0 ||
+          this.currentPanelistChunkText.trim()
+        ) {
+          return;
         }
-      }
-    }, 1800);
+        const promptText = spoken
+          ? `[Candidate finished answering: "${spoken}"]`
+          : '[Candidate has finished speaking. Please respond to their answer and ask your next question.]';
+        this.sendClientTurnText(promptText);
+      }, 1200);
+    } else {
+      // User pressed the button without speaking (panelist stopped mid-way or stalled)
+      this.requestPanelistContinuation('manual-nudge');
+    }
+
+    // 4. Recovery watchdog if no model turn arrives within 4.5 seconds
+    this.armResponseWatchdog();
   }
 
   public isMuted(): boolean {
@@ -509,6 +528,13 @@ export class PanelBoardLiveController {
 
     // 1. Playback Context (24kHz native for Gemini Live Audio output)
     this.playbackContext = new AudioContextClass({ sampleRate: 24000 });
+    if (this.playbackContext.state === 'suspended') {
+      try {
+        await this.playbackContext.resume();
+      } catch (err) {
+        console.warn('Playback AudioContext resume deferred:', err);
+      }
+    }
     this.analyserNode = this.playbackContext.createAnalyser();
     this.analyserNode.fftSize = 256;
     this.analyserNode.smoothingTimeConstant = 0.3;
@@ -531,6 +557,13 @@ export class PanelBoardLiveController {
 
     // Mic Context
     this.micContext = new AudioContextClass();
+    if (this.micContext.state === 'suspended') {
+      try {
+        await this.micContext.resume();
+      } catch (err) {
+        console.warn('Mic AudioContext resume deferred:', err);
+      }
+    }
     this.micSource = this.micContext.createMediaStreamSource(stream);
 
     // ScriptProcessor to capture PCM frames
@@ -550,7 +583,20 @@ export class PanelBoardLiveController {
   }
 
   private handleMicAudioProcess(event: AudioProcessingEvent): void {
-    if (this.isDestroyed || this.isMicMuted || !this.activeSession) {
+    const isGated =
+      this.isDestroyed ||
+      this.isMicMuted ||
+      !this.activeSession ||
+      this.isReconnecting ||
+      this.isAwaitingPanelistResponse ||
+      this.isModelGenerating ||
+      this.scheduledSources.length > 0 ||
+      Date.now() - this.panelistPlaybackEndedAt < 400;
+
+    if (isGated) {
+      if (this.hasStreamedCandidateAudioInTurn) {
+        this.sendAudioStreamEndOnce();
+      }
       if (this.smoothedCandidateLevel !== 0) {
         this.smoothedCandidateLevel = 0;
         this.callbacks.onAudioLevel?.('candidate', 0);
@@ -576,24 +622,6 @@ export class PanelBoardLiveController {
       this.callbacks.onAudioLevel?.('candidate', this.smoothedCandidateLevel);
     }
 
-    // Anti-Noise Half-Duplex Mic Ducking While Panelist Speaks:
-    // Solves abrupt silence on coughs, desk taps, breaths, or laptop speaker echo.
-    const isPanelistCurrentlyPlaying = this.scheduledSources.length > 0;
-    if (isPanelistCurrentlyPlaying) {
-      if (rms > 0.25) {
-        this.consecutiveLoudFramesWhilePanelistSpeaking++;
-      } else {
-        this.consecutiveLoudFramesWhilePanelistSpeaking = 0;
-      }
-
-      // Unless continuous loud intentional barge-in speech for >= 5 frames (~1.2s), duck mic
-      if (this.consecutiveLoudFramesWhilePanelistSpeaking < 5) {
-        return;
-      }
-    } else {
-      this.consecutiveLoudFramesWhilePanelistSpeaking = 0;
-    }
-
     // Resample to 16kHz mono and convert to 16-bit PCM little-endian
     const inputSampleRate = this.micContext?.sampleRate || 44100;
     const resampled16k = resampleTo16k(inputData, inputSampleRate);
@@ -601,12 +629,16 @@ export class PanelBoardLiveController {
     const base64Audio = arrayBufferToBase64(pcm16Buffer);
 
     try {
-      this.activeSession.sendRealtimeInput({
+      this.activeSession?.sendRealtimeInput({
         audio: {
           data: base64Audio,
           mimeType: 'audio/pcm;rate=16000',
         },
       });
+      this.hasStreamedCandidateAudioInTurn = true;
+      if (rms > 0.035) {
+        this.hasCandidateVoiceActivityInTurn = true;
+      }
     } catch (err) {
       // In case WebSocket is temporarily closing or switching
       console.warn('Could not send realtime audio chunk:', err);
@@ -642,15 +674,13 @@ export class PanelBoardLiveController {
     }, 100);
   }
 
-  private async queueAudioPlayback(base64Pcm: string): Promise<void> {
+  private queueAudioPlayback(base64Pcm: string): void {
     if (!this.playbackContext || !this.analyserNode) return;
 
     if (this.playbackContext.state === 'suspended') {
-      try {
-        await this.playbackContext.resume();
-      } catch (err) {
+      this.playbackContext.resume().catch((err) => {
         console.warn('Failed to resume playback audio context:', err);
-      }
+      });
     }
 
     const float32 = base64ToFloat32Array(base64Pcm);
@@ -672,6 +702,13 @@ export class PanelBoardLiveController {
     this.nextPlayTime += audioBuffer.duration;
     this.scheduledSources.push(source);
 
+    // Keep handoff / completion safety timer extended past newly scheduled trailing chunks
+    if (this.pendingHandoffSeat !== null) {
+      this.refreshPendingHandoffTimer('handoff');
+    } else if (this.pendingInterviewComplete !== null) {
+      this.refreshPendingHandoffTimer('complete');
+    }
+
     source.onended = () => {
       const idx = this.scheduledSources.indexOf(source);
       if (idx !== -1) {
@@ -682,15 +719,8 @@ export class PanelBoardLiveController {
         this.smoothedPanelistLevel = 0;
         this.callbacks.onAudioLevel?.('panelist', 0);
 
-        // Check if handoff was scheduled and is waiting for speech to finish
-        if (this.pendingHandoffSeat !== null) {
-          const target = this.pendingHandoffSeat;
-          this.pendingHandoffSeat = null;
-          this.performHandoff(target);
-        } else if (this.pendingInterviewComplete !== null) {
-          const summary = this.pendingInterviewComplete;
-          this.pendingInterviewComplete = null;
-          this.handleInterviewFinalized(summary);
+        if (!this.isModelGenerating) {
+          this.onPanelistTurnPlaybackFinished();
         }
       }
     };
@@ -710,12 +740,36 @@ export class PanelBoardLiveController {
     this.callbacks.onAudioLevel?.('panelist', 0);
   }
 
-  private handleInterruption(): void {
-    // Barge-In: candidate spoke over panelist -> immediately clear scheduled audio playback
+  private handleInterruption(userInitiated: boolean): void {
     this.stopPlaybackQueue();
     this.clearFinishTurnWatchdog();
-    this.currentPanelistChunkText = '';
-    this.callbacks.onTranscriptUpdate?.(this.transcript, undefined);
+    this.clearHybridVadFallbackTimer();
+
+    const partialPanelist = this.currentPanelistChunkText.trim();
+    if (partialPanelist) {
+      const panelist = PANELISTS_BY_SEAT[this.activeSeat];
+      this.addTranscriptEntry({
+        speaker: 'panelist',
+        seat: this.activeSeat,
+        speakerName: panelist.name,
+        text: userInitiated ? `${partialPanelist} (interrupted)` : partialPanelist,
+      });
+      this.currentPanelistChunkText = '';
+    }
+
+    this.pendingAutoContinuationReason = null;
+    this.consecutiveShortFillerAutoNudges = 0;
+    this.toolCalledInCurrentTurn = false;
+    this.isModelGenerating = false;
+    this.isAwaitingPanelistResponse = false;
+    this.panelistPlaybackEndedAt = userInitiated ? 0 : Date.now();
+    this.hasStreamedCandidateAudioInTurn = false;
+    this.hasCandidateVoiceActivityInTurn = false;
+    this.callbacks.onTranscriptUpdate?.([...this.transcript], undefined);
+
+    if (!this.isDestroyed && this.status !== 'switching' && this.status !== 'completed') {
+      this.setStatus('listening');
+    }
   }
 
   // ==========================================
@@ -725,6 +779,9 @@ export class PanelBoardLiveController {
   private async connectToSeat(seat: PanelSeatId): Promise<void> {
     this.activeSeat = seat;
     const panelist = PANELISTS_BY_SEAT[seat];
+    const isResume = this.transcript.some(
+      (entry) => entry.speaker === 'panelist' && entry.seat === seat
+    );
     this.callbacks.onActiveSeatChange?.(seat, panelist);
 
     const candidateModels: string[] = [];
@@ -750,14 +807,14 @@ export class PanelBoardLiveController {
 
     outerLoop: for (const model of candidateModels) {
       for (const apiVersion of apiVersions) {
+        const client = new GoogleGenAI({
+          apiKey: this.apiKey,
+          httpOptions: {
+            apiVersion,
+          },
+        });
         try {
-          const client = new GoogleGenAI({
-            apiKey: this.apiKey,
-            httpOptions: {
-              apiVersion,
-            },
-          });
-          session = await this.openLiveSession(client, model, seat, panelist);
+          session = await this.openLiveSession(client, model, seat, panelist, true);
           this.workingModel = model;
           this.activeApiVersion = apiVersion;
           this.aiClient = client;
@@ -765,9 +822,26 @@ export class PanelBoardLiveController {
         } catch (err) {
           lastError = err instanceof Error ? err : new Error(String(err));
           console.warn(
-            `Connection to Gemini Live with model ${model} (apiVersion: ${apiVersion}) failed on Seat ${seat}, trying fallback:`,
+            `Connection to Gemini Live with model ${model} (apiVersion: ${apiVersion}) failed on Seat ${seat}:`,
             err
           );
+
+          // If a legacy fallback model rejects realtimeInputConfig, retry once without it
+          if (!this.isDestroyed && !/api key|unauthorized|forbidden|permission denied/i.test(lastError.message)) {
+            try {
+              session = await this.openLiveSession(client, model, seat, panelist, false);
+              this.workingModel = model;
+              this.activeApiVersion = apiVersion;
+              this.aiClient = client;
+              break outerLoop;
+            } catch (retryErr) {
+              lastError = retryErr instanceof Error ? retryErr : new Error(String(retryErr));
+              console.warn(
+                `Fallback connection without realtimeInputConfig for ${model} (apiVersion: ${apiVersion}) also failed:`,
+                retryErr
+              );
+            }
+          }
         }
       }
     }
@@ -780,17 +854,21 @@ export class PanelBoardLiveController {
     }
 
     this.activeSession = session;
+    this.isIntentionallyClosing = false;
+    this.isReconnecting = false;
+    this.reconnectAttempts = 0;
     this.setStatus('connected');
 
-    // Send initial kickoff prompt to start conversation for this seat
-    this.sendKickstartPrompt(seat, panelist);
+    // Send initial kickoff prompt to start or resume conversation for this seat
+    this.sendKickstartPrompt(seat, panelist, isResume);
   }
 
   private async openLiveSession(
     client: GoogleGenAI,
     model: string,
     seat: PanelSeatId,
-    panelist: PanelistConfig
+    panelist: PanelistConfig,
+    includeRealtimeInputConfig: boolean
   ): Promise<Session> {
     const systemPrompt = buildPanelistSystemPrompt(
       seat,
@@ -801,67 +879,80 @@ export class PanelBoardLiveController {
 
     let isEstablished = false;
 
+    const config: Parameters<GoogleGenAI['live']['connect']>[0]['config'] = {
+      responseModalities: [Modality.AUDIO],
+      speechConfig: {
+        voiceConfig: {
+          prebuiltVoiceConfig: {
+            voiceName: panelist.voiceName,
+          },
+        },
+      },
+      systemInstruction: {
+        parts: [{ text: systemPrompt }],
+      },
+      tools: [
+        {
+          functionDeclarations: [
+            {
+              name: 'hand_over_to_next_panelist',
+              description:
+                'Pass the interview turn to the next board member (Seat 1 to 4). Call this when you have completed your quota of questions.',
+              parameters: {
+                type: Type.OBJECT,
+                properties: {
+                  nextSeat: {
+                    type: Type.INTEGER,
+                    description: 'The seat number (1, 2, 3, or 4) of the next interviewer.',
+                  },
+                  briefSummaryOfCandidateSoFar: {
+                    type: Type.STRING,
+                    description: 'A brief 1-sentence handover note about the candidate.',
+                  },
+                },
+                required: ['nextSeat'],
+              },
+            },
+            {
+              name: 'complete_interview',
+              description:
+                'Formally conclude the 4-member interview panel when all board members have finished their questions.',
+              parameters: {
+                type: Type.OBJECT,
+                properties: {
+                  closingRemarkSummary: {
+                    type: Type.STRING,
+                    description: 'Final summary and closing remarks of the board.',
+                  },
+                },
+              },
+            },
+          ],
+        },
+      ],
+      inputAudioTranscription: {},
+      outputAudioTranscription: {},
+    };
+
+    if (includeRealtimeInputConfig) {
+      config.realtimeInputConfig = {
+        activityHandling: ActivityHandling.NO_INTERRUPTION,
+        automaticActivityDetection: {
+          disabled: false,
+          startOfSpeechSensitivity: StartSensitivity.START_SENSITIVITY_LOW,
+          endOfSpeechSensitivity: EndSensitivity.END_SENSITIVITY_LOW,
+          prefixPaddingMs: 300,
+          silenceDurationMs: 1800,
+        },
+      };
+    }
+
     const session = await client.live.connect({
       model,
-      config: {
-        responseModalities: [Modality.AUDIO],
-        speechConfig: {
-          voiceConfig: {
-            prebuiltVoiceConfig: {
-              voiceName: panelist.voiceName,
-            },
-          },
-        },
-        systemInstruction: {
-          parts: [{ text: systemPrompt }],
-        },
-        tools: [
-          {
-            functionDeclarations: [
-              {
-                name: 'hand_over_to_next_panelist',
-                description:
-                  'Pass the interview turn to the next board member (Seat 1 to 4). Call this when you have completed your quota of questions.',
-                parameters: {
-                  type: Type.OBJECT,
-                  properties: {
-                    nextSeat: {
-                      type: Type.INTEGER,
-                      description: 'The seat number (1, 2, 3, or 4) of the next interviewer.',
-                    },
-                    briefSummaryOfCandidateSoFar: {
-                      type: Type.STRING,
-                      description: 'A brief 1-sentence handover note about the candidate.',
-                    },
-                  },
-                  required: ['nextSeat'],
-                },
-              },
-              {
-                name: 'complete_interview',
-                description:
-                  'Formally conclude the 4-member interview panel when all board members have finished their questions.',
-                parameters: {
-                  type: Type.OBJECT,
-                  properties: {
-                    closingRemarkSummary: {
-                      type: Type.STRING,
-                      description: 'Final summary and closing remarks of the board.',
-                    },
-                  },
-                },
-              },
-            ],
-          },
-        ],
-        inputAudioTranscription: {},
-        outputAudioTranscription: {},
-      },
+      config,
       callbacks: {
         onopen: () => {
-          if (!this.isDestroyed) {
-            this.setStatus('connected');
-          }
+          // Wait until connect() resolves setupComplete before marking session active
         },
         onmessage: (msg: LiveServerMessage) => {
           this.handleLiveServerMessage(msg);
@@ -884,6 +975,11 @@ export class PanelBoardLiveController {
             console.warn(
               `Live WebSocket closed during setup on Seat ${seat} (model: ${model}, code: ${e.code}): ${e.reason}`
             );
+          } else if (isEstablished && !this.isDestroyed && !this.isIntentionallyClosing) {
+            console.warn(
+              `Live WebSocket closed unexpectedly on Seat ${seat} (code: ${e?.code}, reason: ${e?.reason || 'unknown'}). Attempting recovery...`
+            );
+            void this.handleUnexpectedDisconnect(seat);
           }
         },
       },
@@ -893,40 +989,31 @@ export class PanelBoardLiveController {
     return session;
   }
 
-  private sendKickstartPrompt(seat: PanelSeatId, panelist: PanelistConfig): void {
+  private sendKickstartPrompt(
+    seat: PanelSeatId,
+    panelist: PanelistConfig,
+    isResume: boolean
+  ): void {
     if (!this.activeSession) return;
 
     let kickoffMessage = '';
-    if (seat === 1) {
+    if (isResume) {
+      kickoffMessage = `[SYSTEM EVENT: Brief connection refresh completed for ${panelist.name} (Seat ${seat}). Continue the interview smoothly from the recent conversation context without repeating already-asked questions. State your next complete question or follow-up now.]`;
+    } else if (seat === 1) {
       kickoffMessage = `[SYSTEM EVENT: Candidate ${this.profile.name} has entered the interview room and taken a seat. Greet them warmly as Chairman Shri R.K. Deshmukh, put them at ease, and ask your first question regarding their personal profile and graduation background.]`;
     } else {
       const prevPanelist = PANELISTS_BY_SEAT[((seat - 1) as PanelSeatId) || 1];
       kickoffMessage = `[SYSTEM EVENT: ${prevPanelist.name} (Seat ${prevPanelist.seat}) has completed their turn and passed the microphone to you (${panelist.name}, Seat ${seat}). Briefly acknowledge the handover and ask your first targeted question in your focus area.]`;
     }
 
-    try {
-      this.activeSession.sendClientContent({
-        turns: [
-          {
-            role: 'user',
-            parts: [{ text: kickoffMessage }],
-          },
-        ],
-        turnComplete: true,
-      });
-    } catch (err) {
-      console.warn(
-        'Failed to send seat kickstart message via sendClientContent, falling back to sendRealtimeInput:',
-        err
-      );
-      try {
-        this.activeSession.sendRealtimeInput({
-          text: kickoffMessage,
-        });
-      } catch (fallbackErr) {
-        console.warn('Failed to send seat kickstart message:', fallbackErr);
-      }
-    }
+    this.isAwaitingPanelistResponse = true;
+    this.isModelGenerating = false;
+    this.consecutiveShortFillerAutoNudges = 0;
+    this.pendingAutoContinuationReason = null;
+    this.setStatus('speaking');
+
+    this.sendClientTurnText(kickoffMessage);
+    this.armResponseWatchdog();
   }
 
   // ==========================================
@@ -936,12 +1023,29 @@ export class PanelBoardLiveController {
   private handleLiveServerMessage(msg: LiveServerMessage): void {
     if (this.isDestroyed) return;
 
+    if (msg.goAway) {
+      console.warn('Gemini Live GoAway received, remaining time:', msg.goAway.timeLeft);
+    }
+
+    // Process tool calls before turnComplete so handoff/completion state is known
+    if (msg.toolCall?.functionCalls) {
+      this.toolCalledInCurrentTurn = true;
+      for (const call of msg.toolCall.functionCalls) {
+        this.handleToolCall(call);
+      }
+    }
+
     const content = msg.serverContent;
     if (content) {
       // 1. Process Audio Output Chunks
       if (content.modelTurn?.parts) {
-        // Clear any waiting finish-turn watchdog since the model has started responding
         this.clearFinishTurnWatchdog();
+        this.clearHybridVadFallbackTimer();
+        this.isModelGenerating = true;
+        this.isAwaitingPanelistResponse = true;
+        if (this.status !== 'speaking' && this.status !== 'switching') {
+          this.setStatus('speaking');
+        }
 
         // Flush accumulated candidate transcript if model has started replying
         this.flushCandidateTranscript();
@@ -961,13 +1065,21 @@ export class PanelBoardLiveController {
         }
       }
 
-      // 2. Interruption Detection (Barge-in)
+      // 2. Interruption Detection (only expected on legacy fallback models if NO_INTERRUPTION is unsupported)
       if (content.interrupted) {
-        this.handleInterruption();
+        this.handleInterruption(false);
+        return;
       }
 
       // 3. Panelist Speech Transcription (Output audio transcription)
       if (content.outputTranscription?.text) {
+        this.clearFinishTurnWatchdog();
+        this.clearHybridVadFallbackTimer();
+        this.isModelGenerating = true;
+        this.isAwaitingPanelistResponse = true;
+        if (this.status !== 'speaking' && this.status !== 'switching') {
+          this.setStatus('speaking');
+        }
         this.currentPanelistChunkText += content.outputTranscription.text;
         this.callbacks.onTranscriptUpdate?.(this.transcript, {
           speaker: 'panelist',
@@ -996,28 +1108,49 @@ export class PanelBoardLiveController {
         }
       }
 
-      // 5. Turn Complete: finalize utterances in transcript
+      // 5. Turn Complete: finalize utterances and coordinate turn state
       if (content.turnComplete) {
+        this.isModelGenerating = false;
+        this.clearFinishTurnWatchdog();
+        this.clearHybridVadFallbackTimer();
+
         // Finalize candidate speech if pending
         this.flushCandidateTranscript();
 
-        if (this.currentPanelistChunkText.trim()) {
+        const completedPanelistText = this.currentPanelistChunkText.trim();
+        if (completedPanelistText) {
           const panelist = PANELISTS_BY_SEAT[this.activeSeat];
           this.addTranscriptEntry({
             speaker: 'panelist',
             seat: this.activeSeat,
             speakerName: panelist.name,
-            text: this.currentPanelistChunkText.trim(),
+            text: completedPanelistText,
           });
           this.currentPanelistChunkText = '';
         }
-      }
-    }
 
-    // 6. Function Tools Execution (Handoff or Completion)
-    if (msg.toolCall?.functionCalls) {
-      for (const call of msg.toolCall.functionCalls) {
-        this.handleToolCall(call);
+        const isPendingTransition =
+          this.pendingHandoffSeat !== null || this.pendingInterviewComplete !== null;
+
+        if (
+          !isPendingTransition &&
+          !this.toolCalledInCurrentTurn &&
+          this.isFillerOnlyTurn(completedPanelistText) &&
+          this.consecutiveShortFillerAutoNudges < 2
+        ) {
+          this.consecutiveShortFillerAutoNudges++;
+          this.pendingAutoContinuationReason = 'auto-filler';
+          this.isAwaitingPanelistResponse = true;
+        } else {
+          this.consecutiveShortFillerAutoNudges = 0;
+          this.pendingAutoContinuationReason = null;
+        }
+
+        this.toolCalledInCurrentTurn = false;
+
+        if (this.scheduledSources.length === 0) {
+          this.onPanelistTurnPlaybackFinished();
+        }
       }
     }
   }
@@ -1088,35 +1221,237 @@ export class PanelBoardLiveController {
   }
 
   // ==========================================
-  // Multi-Panelist Handoff Orchestration
+  // Multi-Panelist Handoff & Turn Helpers
   // ==========================================
+
+  private onPanelistTurnPlaybackFinished(): void {
+    if (this.isDestroyed) return;
+
+    if (this.pendingHandoffSeat !== null) {
+      const target = this.pendingHandoffSeat;
+      this.pendingHandoffSeat = null;
+      this.clearPendingHandoffTimer();
+      void this.performHandoff(target);
+      return;
+    }
+
+    if (this.pendingInterviewComplete !== null) {
+      const summary = this.pendingInterviewComplete;
+      this.pendingInterviewComplete = null;
+      this.clearPendingHandoffTimer();
+      this.handleInterviewFinalized(summary);
+      return;
+    }
+
+    if (this.pendingAutoContinuationReason === 'auto-filler') {
+      this.pendingAutoContinuationReason = null;
+      this.requestPanelistContinuation('auto-filler');
+      this.armResponseWatchdog();
+      return;
+    }
+
+    this.enterListeningState();
+  }
+
+  private enterListeningState(): void {
+    this.isAwaitingPanelistResponse = false;
+    this.isModelGenerating = false;
+    this.toolCalledInCurrentTurn = false;
+    this.panelistPlaybackEndedAt = Date.now();
+    this.hasStreamedCandidateAudioInTurn = false;
+    this.hasCandidateVoiceActivityInTurn = false;
+    if (
+      !this.isDestroyed &&
+      this.status !== 'switching' &&
+      this.status !== 'completed' &&
+      this.status !== 'error'
+    ) {
+      this.setStatus('listening');
+    }
+  }
+
+  private isFillerOnlyTurn(text: string): boolean {
+    const clean = text.trim();
+    if (!clean) return true;
+    if (clean.includes('?') || clean.length > 50) return false;
+
+    if (
+      /^(i see|right|okay|ok|very well|achha|accha|hmm+|yes|uh-huh|sure|alright|go on|go ahead|please continue|thank you|thanks|noted|good|fine|carry on|continue)[.!,\s]*$/i.test(
+        clean
+      )
+    ) {
+      return true;
+    }
+
+    const words = clean.replace(/[.!,;:]+$/g, '').split(/\s+/).filter(Boolean);
+    return words.length <= 3;
+  }
+
+  private requestPanelistContinuation(reason: 'auto-filler' | 'manual-nudge' | 'watchdog'): void {
+    if (this.isDestroyed || !this.activeSession) return;
+
+    this.isAwaitingPanelistResponse = true;
+    if (this.status !== 'speaking' && this.status !== 'switching') {
+      this.setStatus('speaking');
+    }
+
+    const promptText =
+      reason === 'auto-filler'
+        ? '[SYSTEM: Your previous turn was only a brief acknowledgment without a complete question. Immediately continue speaking and ask your complete interview question (or call the handoff tool if your quota is done).]'
+        : '[SYSTEM: Please continue and state your complete interview question clearly to the candidate now.]';
+
+    this.sendClientTurnText(promptText);
+  }
+
+  private armResponseWatchdog(): void {
+    this.clearFinishTurnWatchdog();
+    this.finishTurnWatchdogTimer = setTimeout(() => {
+      this.finishTurnWatchdogTimer = null;
+      if (this.isDestroyed || this.isReconnecting) return;
+
+      if (!this.activeSession) {
+        void this.handleUnexpectedDisconnect(this.activeSeat);
+        return;
+      }
+
+      if (
+        !this.isModelGenerating &&
+        this.scheduledSources.length === 0 &&
+        !this.currentPanelistChunkText.trim()
+      ) {
+        console.log('Watchdog: Panelist silent after prompt, sending recovery nudge.');
+        const sent = this.sendClientTurnText(
+          '[SYSTEM: The candidate is waiting. Please respond and state your next interview question clearly now.]'
+        );
+        if (!sent) {
+          void this.handleUnexpectedDisconnect(this.activeSeat);
+        }
+      }
+    }, 4500);
+  }
+
+  private sendClientTurnText(text: string): boolean {
+    if (!this.activeSession || this.isDestroyed) return false;
+    this.lastTurnSignalSentAt = Date.now();
+
+    try {
+      this.activeSession.sendClientContent({
+        turns: [
+          {
+            role: 'user',
+            parts: [{ text }],
+          },
+        ],
+        turnComplete: true,
+      });
+      return true;
+    } catch (err) {
+      console.warn(
+        'Failed to send turn text via sendClientContent, falling back to sendRealtimeInput:',
+        err
+      );
+      try {
+        this.activeSession.sendRealtimeInput({ text });
+        return true;
+      } catch (fallbackErr) {
+        console.warn('Failed to send fallback turn text:', fallbackErr);
+        return false;
+      }
+    }
+  }
+
+  private sendAudioStreamEndOnce(): void {
+    if (!this.hasStreamedCandidateAudioInTurn) return;
+    this.hasStreamedCandidateAudioInTurn = false;
+    try {
+      this.activeSession?.sendRealtimeInput({ audioStreamEnd: true });
+    } catch {}
+  }
+
+  private async handleUnexpectedDisconnect(seat: PanelSeatId): Promise<void> {
+    if (this.isDestroyed || this.isIntentionallyClosing || this.isReconnecting) return;
+
+    if (this.reconnectAttempts >= 2) {
+      this.isAwaitingPanelistResponse = false;
+      this.isModelGenerating = false;
+      this.setStatus('error');
+      this.callbacks.onError?.(
+        new Error('Live session disconnected unexpectedly. Please click Join & Start Interview to reconnect.')
+      );
+      return;
+    }
+
+    this.isReconnecting = true;
+    this.reconnectAttempts++;
+    this.clearFinishTurnWatchdog();
+    this.clearHybridVadFallbackTimer();
+    this.clearPendingHandoffTimer();
+    this.stopPlaybackQueue();
+
+    this.flushCandidateTranscript();
+    if (this.currentPanelistChunkText.trim()) {
+      const panelist = PANELISTS_BY_SEAT[this.activeSeat];
+      this.addTranscriptEntry({
+        speaker: 'panelist',
+        seat: this.activeSeat,
+        speakerName: panelist.name,
+        text: this.currentPanelistChunkText.trim(),
+      });
+      this.currentPanelistChunkText = '';
+    }
+
+    this.activeSession = null;
+    this.isModelGenerating = false;
+    this.isAwaitingPanelistResponse = true;
+    this.setStatus('connecting');
+
+    try {
+      await this.connectToSeat(seat);
+    } catch (err) {
+      this.isReconnecting = false;
+      this.isAwaitingPanelistResponse = false;
+      this.setStatus('error');
+      this.callbacks.onError?.(err instanceof Error ? err : new Error(String(err)));
+    }
+  }
+
+  private refreshPendingHandoffTimer(kind: 'handoff' | 'complete'): void {
+    this.clearPendingHandoffTimer();
+    const remainingAudioDuration =
+      this.playbackContext && this.nextPlayTime > this.playbackContext.currentTime
+        ? (this.nextPlayTime - this.playbackContext.currentTime) * 1000 + 500
+        : 1200;
+
+    this.handoffTimeoutId = setTimeout(() => {
+      if (kind === 'handoff' && this.pendingHandoffSeat !== null) {
+        const next = this.pendingHandoffSeat;
+        this.pendingHandoffSeat = null;
+        void this.performHandoff(next);
+      } else if (kind === 'complete' && this.pendingInterviewComplete !== null) {
+        const finalSummary = this.pendingInterviewComplete;
+        this.pendingInterviewComplete = null;
+        this.handleInterviewFinalized(finalSummary);
+      }
+    }, Math.max(800, remainingAudioDuration));
+  }
 
   private scheduleHandoff(targetSeat: PanelSeatId): void {
     if (targetSeat === this.activeSeat) return;
 
-    this.clearPendingHandoffTimer();
     this.pendingHandoffSeat = targetSeat;
-
-    // If audio is actively playing, the source.onended listener will execute handoff
-    // after the spoken handoff sentence completes.
-    // Also set a safety timeout in case onended doesn't fire.
-    const remainingAudioDuration =
-      this.playbackContext && this.nextPlayTime > this.playbackContext.currentTime
-        ? (this.nextPlayTime - this.playbackContext.currentTime) * 1000 + 400
-        : 1200;
-
-    this.handoffTimeoutId = setTimeout(() => {
-      if (this.pendingHandoffSeat !== null) {
-        const next = this.pendingHandoffSeat;
-        this.pendingHandoffSeat = null;
-        this.performHandoff(next);
-      }
-    }, Math.max(800, remainingAudioDuration));
+    this.refreshPendingHandoffTimer('handoff');
   }
 
   private async performHandoff(targetSeat: PanelSeatId): Promise<void> {
     if (this.isDestroyed) return;
 
+    this.clearFinishTurnWatchdog();
+    this.clearHybridVadFallbackTimer();
+    this.clearPendingHandoffTimer();
+    this.pendingAutoContinuationReason = null;
+    this.consecutiveShortFillerAutoNudges = 0;
+    this.isModelGenerating = false;
+    this.isAwaitingPanelistResponse = true;
     this.setStatus('switching');
     playHandoffTick();
 
@@ -1143,8 +1478,9 @@ export class PanelBoardLiveController {
       text: `Floor passed to Seat ${targetSeat}: ${nextPanelist.name} (${nextPanelist.roleFocus})`,
     });
 
-    // Close existing WebSocket session cleanly
+    // Close existing WebSocket session cleanly without triggering unexpected-disconnect recovery
     if (this.activeSession) {
+      this.isIntentionallyClosing = true;
       try {
         this.activeSession.close();
       } catch {}
@@ -1155,33 +1491,22 @@ export class PanelBoardLiveController {
     try {
       await this.connectToSeat(targetSeat);
     } catch (err) {
+      this.isAwaitingPanelistResponse = false;
       this.setStatus('error');
       this.callbacks.onError?.(err instanceof Error ? err : new Error(String(err)));
     }
   }
 
   private scheduleInterviewCompletion(summary: string): void {
-    this.clearPendingHandoffTimer();
     this.pendingInterviewComplete = summary;
-
-    const remainingAudioDuration =
-      this.playbackContext && this.nextPlayTime > this.playbackContext.currentTime
-        ? (this.nextPlayTime - this.playbackContext.currentTime) * 1000 + 400
-        : 1200;
-
-    this.handoffTimeoutId = setTimeout(() => {
-      if (this.pendingInterviewComplete !== null) {
-        const finalSummary = this.pendingInterviewComplete;
-        this.pendingInterviewComplete = null;
-        this.handleInterviewFinalized(finalSummary);
-      }
-    }, Math.max(800, remainingAudioDuration));
+    this.refreshPendingHandoffTimer('complete');
   }
 
   private handleInterviewFinalized(summary: string): void {
     if (this.isDestroyed) return;
 
     this.clearFinishTurnWatchdog();
+    this.clearHybridVadFallbackTimer();
     this.flushCandidateTranscript();
 
     if (this.currentPanelistChunkText.trim()) {
@@ -1201,6 +1526,8 @@ export class PanelBoardLiveController {
       text: `Interview successfully concluded. Generating final evaluation scorecard...`,
     });
 
+    this.isAwaitingPanelistResponse = false;
+    this.isModelGenerating = false;
     this.setStatus('completed');
     this.callbacks.onInterviewComplete?.(summary);
   }
@@ -1221,6 +1548,13 @@ export class PanelBoardLiveController {
     if (this.finishTurnWatchdogTimer) {
       clearTimeout(this.finishTurnWatchdogTimer);
       this.finishTurnWatchdogTimer = null;
+    }
+  }
+
+  private clearHybridVadFallbackTimer(): void {
+    if (this.hybridVadFallbackTimer) {
+      clearTimeout(this.hybridVadFallbackTimer);
+      this.hybridVadFallbackTimer = null;
     }
   }
 

@@ -233,11 +233,6 @@ export default function BoardroomPage() {
         callbacks: {
           onStatusChange: (newStatus) => {
             setStatus(newStatus);
-            if (newStatus === 'connected') {
-              import('@/lib/ui-sound')
-                .then((m) => m.playJoinChime?.())
-                .catch(() => {});
-            }
           },
           onActiveSeatChange: (seat) => {
             const prevSeat = activeSeatRef.current;
@@ -382,7 +377,7 @@ export default function BoardroomPage() {
     if (!isCallLive || panelistSpeaking) return;
 
     try {
-      (controller as any)?.finishCandidateTurn?.();
+      controller?.finishCandidateTurn();
     } catch (err) {
       console.warn('finishCandidateTurn failed:', err);
     }
@@ -391,10 +386,6 @@ export default function BoardroomPage() {
     setTimeout(() => {
       setDoneSpeakingFlash(false);
     }, 1200);
-
-    import('@/lib/ui-sound')
-      .then((m) => (m as any).playDoneSpeakingPop?.())
-      .catch(() => {});
   }, [controller, isCallLive, panelistSpeaking]);
 
   // Spacebar keyboard listener for Done Speaking
@@ -1149,10 +1140,14 @@ export default function BoardroomPage() {
                   type="button"
                   onClick={handleDoneSpeaking}
                   className="h-11 px-4 rounded-full bg-[#E5B869]/15 hover:bg-[#E5B869]/25 border border-[#E5B869]/35 hover:border-[#E5B869]/60 text-[#F7E3B5] transition flex items-center gap-2 cursor-pointer shadow-md hover:shadow-[0_0_15px_rgba(229,184,105,0.2)] text-xs font-medium animate-fade-in"
-                  title="Signal to panelist that you are finished speaking (Shortcut: Space)"
+                  title={
+                    status === 'speaking'
+                      ? 'Nudge panelist to continue (Shortcut: Space)'
+                      : 'Signal to panelist that you are finished speaking (Shortcut: Space)'
+                  }
                 >
                   <Check className="w-4 h-4 text-[#E5B869]" strokeWidth={2} />
-                  <span>Done Speaking</span>
+                  <span>{status === 'speaking' ? 'Continue Panelist' : 'Done Speaking'}</span>
                   <span className="px-1.5 py-0.5 rounded bg-zinc-950/80 border border-[#E5B869]/40 font-mono text-[10px] text-[#F7E3B5] font-semibold shadow-inner">
                     Space
                   </span>

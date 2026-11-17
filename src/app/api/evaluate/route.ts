@@ -9,6 +9,68 @@ interface EvaluateRequestBody {
   webcamSnapshots?: string[]; // Array of base64 data URLs (e.g. data:image/jpeg;base64,...)
 }
 
+interface InterviewExchange {
+  seat?: number;
+  askedBy: string;
+  questionText: string;
+  candidateParts: string[];
+  candidateVerbatimAnswer: string;
+}
+
+function buildStructuredExchanges(transcript: TranscriptEntry[]): InterviewExchange[] {
+  const exchanges: InterviewExchange[] = [];
+  let current: InterviewExchange | null = null;
+
+  for (const entry of transcript) {
+    const text = (entry.text || '').trim();
+    if (!text || entry.speaker === 'system') continue;
+
+    if (entry.speaker === 'panelist') {
+      if (
+        current &&
+        current.candidateParts.length === 0 &&
+        current.seat === entry.seat &&
+        current.askedBy === entry.speakerName
+      ) {
+        current.questionText = `${current.questionText} ${text}`.trim();
+      } else {
+        current = {
+          seat: entry.seat,
+          askedBy: entry.speakerName || 'Panelist',
+          questionText: text,
+          candidateParts: [],
+          candidateVerbatimAnswer: '',
+        };
+        exchanges.push(current);
+      }
+    } else if (entry.speaker === 'candidate') {
+      if (!current) {
+        current = {
+          askedBy: 'Board Panel',
+          questionText: '(Opening interaction)',
+          candidateParts: [],
+          candidateVerbatimAnswer: '',
+        };
+        exchanges.push(current);
+      }
+      current.candidateParts.push(text);
+    }
+  }
+
+  for (const ex of exchanges) {
+    ex.candidateVerbatimAnswer = ex.candidateParts.join(' ').trim();
+  }
+
+  return exchanges;
+}
+
+function computeVerdict(score: number): EvaluationReport['verdict'] {
+  if (score >= 80) return 'Selected (High Merit)';
+  if (score >= 65) return 'Selected (Borderline)';
+  if (score >= 50) return 'Waitlisted';
+  return 'Needs Improvement';
+}
+
 function cleanJsonString(raw: string): string {
   let cleaned = raw.trim();
   if (cleaned.startsWith('```json')) {
@@ -38,21 +100,100 @@ export async function POST(request: Request) {
       );
     }
 
-    // Format transcript entries chronologically
-    const transcriptFormatted = transcript
-      .map((entry) => `[${entry.speakerName}]: ${entry.text}`)
-      .join('\n\n');
+    const exchanges = buildStructuredExchanges(transcript);
+    const totalExchanges = exchanges.length;
+    const answeredExchanges = exchanges.filter(
+      (ex) => ex.candidateVerbatimAnswer.length > 0
+    ).length;
+    const totalCandidateWords = transcript
+      .filter((entry) => entry.speaker === 'candidate')
+      .reduce(
+        (sum, entry) =>
+          sum + (entry.text || '').trim().split(/\s+/).filter(Boolean).length,
+        0
+      );
+
+    // Deterministic zero-score report when no candidate responses were recorded
+    if (answeredExchanges === 0 || totalCandidateWords === 0) {
+      const zeroReport: EvaluationReport = {
+        overallScore: 0,
+        verdict: 'Needs Improvement',
+        categoryScores: {
+          bankingAwareness: {
+            score: 0,
+            max: 30,
+            note: 'No candidate responses were recorded to assess banking awareness or RBI knowledge.',
+          },
+          personalProfileConviction: {
+            score: 0,
+            max: 25,
+            note: 'No candidate responses were recorded to evaluate profile conviction or career rationale.',
+          },
+          situationalOfficerQualities: {
+            score: 0,
+            max: 20,
+            note: 'No candidate responses were recorded for situational judgment or branch scenarios.',
+          },
+          honestyAntiBluff: {
+            score: 0,
+            max: 15,
+            note: 'No spoken or typed answers were recorded in this session.',
+            bluffsDetected: [],
+          },
+          communicationAndBodyLanguage: {
+            score: 0,
+            max: 10,
+            note: 'No verbal answers were recorded during the interview.',
+            webcamObservations: [],
+          },
+        },
+        questionByQuestion: exchanges.map((ex) => ({
+          question: ex.questionText,
+          askedBy: ex.askedBy,
+          candidateAnswer: '(No response provided by candidate)',
+          scoreOutOf10: 0,
+          critique: 'No verbal or typed response was recorded from the candidate for this question.',
+          idealModelAnswer:
+            'Address the panelist respectfully, answer directly with concrete banking or personal context, and press Space / Done Speaking when finished.',
+        })),
+        topStrengths: ['No verbal or typed candidate responses were recorded to identify strengths.'],
+        actionItems: [
+          'Verify your microphone permissions and audio input level indicator in the self-view tile before starting.',
+          'Speak clearly after the panelist finishes, then press Space or click "Done Speaking" (or use the Chat text fallback) to log your answer.',
+          'Complete questions across all four panel seats so the board can grade your full IBPS PO readiness.',
+        ],
+      };
+
+      return NextResponse.json({
+        success: true,
+        report: zeroReport,
+      });
+    }
+
+    const structuredExchangesText =
+      exchanges.length > 0
+        ? exchanges
+            .map(
+              (ex, idx) =>
+                `Exchange ${idx + 1} (${ex.askedBy}${ex.seat ? `, Seat ${ex.seat}` : ''}):\n` +
+                `  Panelist Question: ${ex.questionText}\n` +
+                `  Candidate Verbatim Answer: ${
+                  ex.candidateVerbatimAnswer || '[NO ANSWER PROVIDED BY CANDIDATE]'
+                }`
+            )
+            .join('\n\n')
+        : transcript.map((entry) => `[${entry.speakerName}]: ${entry.text}`).join('\n\n');
 
     const evaluationPrompt = `
 You are the Grand Assessment Committee of the Institute of Banking Personnel Selection (IBPS) and State Bank of India (SBI PO).
 You are conducting a strict, rigorous, and constructive viva voce evaluation for a Probationary Officer candidate.
 
-REFERENCE RBI & BANKING BENCHMARKS (Evaluate candidate's factual accuracy against this ground truth):
+REFERENCE RBI & BANKING BENCHMARKS (Use ONLY to verify whether facts the candidate actually spoke are right or wrong):
 \"\"\"
 ${RBI_FACTSHEET_TEXT}
 \"\"\"
 
-CANDIDATE DETAILED APPLICATION FORM (DAF):
+CANDIDATE DETAILED APPLICATION FORM (DAF) (Use ONLY as background context — NEVER pretend the candidate spoke DAF text unless they actually said it in their answers):
 - Name: ${profile.name}
 - Academic Degree: ${profile.degree} in ${profile.stream} (${profile.graduationYear})
 - Hometown: ${profile.hometown}, ${profile.state}
@@ -62,28 +203,39 @@ CANDIDATE DETAILED APPLICATION FORM (DAF):
 - Language Preference: ${profile.languagePref}
 - Mode: ${profile.sessionMode}
 
-FULL INTERVIEW TRANSCRIPT:
+CANDIDATE PARTICIPATION SUMMARY:
+- Total Panelist Questions Asked: ${totalExchanges}
+- Questions Answered by Candidate: ${answeredExchanges}
+- Total Candidate Words Spoken/Typed: ${totalCandidateWords}
+
+STRUCTURED INTERVIEW EXCHANGES (Evaluate ONLY against the Candidate Verbatim Answer shown below):
 \"\"\"
-${transcriptFormatted}
+${structuredExchangesText}
 \"\"\"
 
 ${
   webcamSnapshots && webcamSnapshots.length > 0
-    ? `NOTE: ${webcamSnapshots.length} webcam frame snapshot(s) of the candidate captured during the live viva are attached. Analyze posture, professional presence, eye gaze, camera framing, and grooming.`
-    : `NOTE: No webcam video snapshots were provided. Assess communication, composure, and professionalism strictly based on verbal transcript flow.`
+    ? `NOTE: ${webcamSnapshots.length} webcam frame snapshot(s) of the candidate captured during the live viva are attached. Analyze posture, professional presence, eye gaze, camera framing, and grooming ONLY from what is visibly observable in those snapshots.`
+    : `NOTE: No webcam video snapshots were provided. Do NOT fabricate visual observations; evaluate communication strictly based on what the candidate actually said.`
 }
+
+STRICT ANTI-HALLUCINATION & GROUNDED GRADING RULES (MANDATORY):
+1. ZERO HALLUCINATION: Never attribute facts, figures (such as Repo rate, CRR, PSL targets, DBT, Lead Bank, or degree rationales), or polished answers from REFERENCE RBI & BANKING BENCHMARKS, the CANDIDATE DAF, or the panelist's question to the candidate unless the candidate explicitly spoke them in "Candidate Verbatim Answer".
+2. UNANSWERED / WEAK ANSWERS: Any exchange marked "[NO ANSWER PROVIDED BY CANDIDATE]" MUST have "candidateAnswer": "(No response provided by candidate)" and "scoreOutOf10": 0. Brief, vague, off-topic, filler-only, or non-substantive answers MUST score 1 to 3 out of 10.
+3. UNASKED / UNANSWERED CATEGORIES: If no questions were answered in a category's domain (e.g., Seat 2/3 for bankingAwareness, Seat 1 for personalProfileConviction, Seat 4 for situationalOfficerQualities), that category MUST score 0 (or be strictly proportional only to the questions actually answered in that category).
+4. ONE-TO-ONE QUESTION CORRESPONDENCE: Populate "questionByQuestion" with one entry per Exchange listed in STRUCTURED INTERVIEW EXCHANGES, preserving the exact order and quoting/summarizing only what the candidate actually said.
 
 SCORING CRITERIA (Total: 100 Marks):
 1. Banking Awareness & RBI Guidelines (Max 30 Marks):
-   - Strict factual grading against official rates, PSL categories (40%, 18% agri, 10% SMF, 7.5% micro, 12% weaker), NPA norms (90-day overdue, SMA stages, provisioning), DICGC (₹5L), and flagships (PMJDY, Mudra, APY).
+   - Strict factual grading against official rates, PSL categories (40%, 18% agri, 10% SMF, 7.5% micro, 12% weaker), NPA norms (90-day overdue, SMA stages, provisioning), DICGC (₹5L), and flagships (PMJDY, Mudra, APY) — ONLY credit what the candidate actually stated.
 2. Profile & Degree Cross-Questioning Conviction (Max 25 Marks):
-   - Ability to defend career choices, gap year justification, degree application to public sector banking, and knowledge of home district/state economy.
+   - Ability to defend career choices, gap year justification, degree application to public sector banking, and knowledge of home district/state economy — ONLY credit what the candidate actually stated.
 3. Situational Officer Qualities & Branch Leadership (Max 20 Marks):
-   - Tact in dealing with irate rural farmers, refusing unlawful VIP pressures, staff coordination, handling branch cash/audit discrepancies, and customer service patience.
+   - Tact in dealing with irate rural farmers, refusing unlawful VIP pressures, staff coordination, handling branch cash/audit discrepancies, and customer service patience — ONLY credit what the candidate actually stated.
 4. Honesty & Anti-Bluffing Integrity (Max 15 Marks):
-   - VERY IMPORTANT: In IBPS interviews, bluffing or guessing wrong financial data is heavily penalized. Candidates who politely and candidly state "I am sorry Sir/Ma'am, I am unable to recall the exact number right now" should receive high honesty marks. List ANY invented facts or erroneous statistics under bluffsDetected.
+   - Candidates who politely admit "I do not know right now" score well here, whereas bluffing or guessing wrong financial data is penalized. If the candidate barely spoke or gave mostly unanswered/off-topic responses, score proportionally low. List ANY invented facts or erroneous statistics under bluffsDetected.
 5. Communication & Body Language (Max 10 Marks):
-   - Clear articulation, active listening, polite prefixes ("Sir/Ma'am"), composure under cross-examination, and visual camera posture/attire observations.
+   - Clear articulation, active listening, polite prefixes ("Sir/Ma'am"), composure under cross-examination, and visual camera posture observations (if snapshots attached).
 
 VERDICT RULES:
 - 80-100: "Selected (High Merit)"
@@ -111,20 +263,20 @@ The JSON must adhere to this exact schema:
       "score": number (0-10),
       "max": 10,
       "note": string,
-      "webcamObservations": string[] (3-4 specific visual and verbal observations regarding posture, eye contact, grooming, or verbal clarity)
+      "webcamObservations": string[] (3-4 grounded observations from snapshots/transcript; empty or honest note if absent)
     }
   },
   "questionByQuestion": [
     {
       "question": string (the question asked by the panelist),
-      "askedBy": string (panelist name or title, e.g. "Chairman Shri R.K. Sharma"),
-      "candidateAnswer": string (summary of what the candidate answered),
+      "askedBy": string (panelist name or title),
+      "candidateAnswer": string (faithful summary of ONLY what the candidate said, or "(No response provided by candidate)"),
       "scoreOutOf10": number (0-10),
-      "critique": string (constructive feedback highlighting inaccuracies or strengths),
+      "critique": string (honest, constructive feedback highlighting gaps, inaccuracies, or missing points),
       "idealModelAnswer": string (the gold-standard answer an elite PO candidate should have given)
     }
   ],
-  "topStrengths": string[] (3-4 notable standout qualities displayed),
+  "topStrengths": string[] (honest standout qualities actually demonstrated; if minimal participation, say so honestly),
   "actionItems": string[] (3-4 high-impact actionable improvements before the real exam)
 }
 `.trim();
@@ -160,7 +312,7 @@ The JSON must adhere to this exact schema:
       contents: contentParts,
       config: {
         responseMimeType: 'application/json',
-        temperature: 0.2,
+        temperature: 0.1,
       },
     });
 
@@ -178,17 +330,87 @@ The JSON must adhere to this exact schema:
       }
     }
 
-    // Ensure overallScore matches category sum if inconsistent
-    const calcOverall =
-      (report.categoryScores?.bankingAwareness?.score || 0) +
-      (report.categoryScores?.personalProfileConviction?.score || 0) +
-      (report.categoryScores?.situationalOfficerQualities?.score || 0) +
-      (report.categoryScores?.honestyAntiBluff?.score || 0) +
-      (report.categoryScores?.communicationAndBodyLanguage?.score || 0);
+    // Post-process questionByQuestion strictly against structured exchanges
+    const rawQuestions = Array.isArray(report.questionByQuestion) ? report.questionByQuestion : [];
+    const alignedMatch = rawQuestions.length === exchanges.length;
+    report.questionByQuestion = rawQuestions.map((q, idx) => {
+      let score = Math.min(10, Math.max(0, Number(q.scoreOutOf10) || 0));
+      let candidateAnswer = (q.candidateAnswer || '').trim();
 
-    if (typeof report.overallScore !== 'number' || Math.abs(report.overallScore - calcOverall) > 5) {
-      report.overallScore = Math.min(100, Math.max(0, calcOverall));
+      if (alignedMatch && !exchanges[idx]?.candidateVerbatimAnswer) {
+        score = 0;
+        candidateAnswer = '(No response provided by candidate)';
+      } else if (
+        !candidateAnswer ||
+        /^(no response|candidate was silent|\(candidate was silent)/i.test(candidateAnswer)
+      ) {
+        score = 0;
+        candidateAnswer = '(No response provided by candidate)';
+      }
+
+      return {
+        ...q,
+        candidateAnswer,
+        scoreOutOf10: Math.round(score * 10) / 10,
+      };
+    });
+
+    // Clamp individual category scores to [0, max]
+    const categoryCaps: Array<
+      [keyof EvaluationReport['categoryScores'], number]
+    > = [
+      ['bankingAwareness', 30],
+      ['personalProfileConviction', 25],
+      ['situationalOfficerQualities', 20],
+      ['honestyAntiBluff', 15],
+      ['communicationAndBodyLanguage', 10],
+    ];
+
+    for (const [key, maxVal] of categoryCaps) {
+      const cat = report.categoryScores?.[key];
+      if (cat) {
+        cat.score = Math.round(Math.min(maxVal, Math.max(0, Number(cat.score) || 0)));
+      }
     }
+
+    // Compute strict mathematical ceiling from actual question-by-question performance
+    const expectedQuestions = Math.max(totalExchanges, 4);
+    const sumQuestionScores = report.questionByQuestion.reduce(
+      (acc, q) => acc + (Number(q.scoreOutOf10) || 0),
+      0
+    );
+    const maxPossibleQuestionScore = expectedQuestions * 10;
+    const questionPerformanceRatio = Math.min(
+      1,
+      Math.max(0, sumQuestionScores / maxPossibleQuestionScore)
+    );
+    let maxAllowedOverall = Math.min(100, Math.round(questionPerformanceRatio * 100) + 5);
+    if (totalCandidateWords < 15) {
+      maxAllowedOverall = Math.min(maxAllowedOverall, 15);
+    }
+
+    const rawCategorySum = categoryCaps.reduce(
+      (acc, [key]) => acc + (report.categoryScores?.[key]?.score || 0),
+      0
+    );
+
+    if (rawCategorySum > maxAllowedOverall && rawCategorySum > 0) {
+      const scale = maxAllowedOverall / rawCategorySum;
+      for (const [key] of categoryCaps) {
+        const cat = report.categoryScores?.[key];
+        if (cat) {
+          cat.score = Math.floor(cat.score * scale);
+        }
+      }
+    }
+
+    // Recompute overallScore as exact sum of clamped category scores and derive verdict deterministically
+    const finalOverall = categoryCaps.reduce(
+      (acc, [key]) => acc + (report.categoryScores?.[key]?.score || 0),
+      0
+    );
+    report.overallScore = Math.min(100, Math.max(0, finalOverall));
+    report.verdict = computeVerdict(report.overallScore);
 
     return NextResponse.json({
       success: true,

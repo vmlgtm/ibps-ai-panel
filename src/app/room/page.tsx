@@ -71,6 +71,7 @@ export default function BoardroomPage() {
 
   // Live Interview Board State
   const [controller, setController] = useState<PanelBoardLiveController | null>(null);
+  const controllerRef = useRef<PanelBoardLiveController | null>(null);
   const [status, setStatus] = useState<LiveSessionStatus>('idle');
   const [activeSeat, setActiveSeat] = useState<PanelSeatId>(1);
   const [panelistSpeaking, setPanelistSpeaking] = useState<boolean>(false);
@@ -87,6 +88,7 @@ export default function BoardroomPage() {
 
   // Transcript & Subtitles
   const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
+  const transcriptRef = useRef<TranscriptEntry[]>([]);
   const [livePartial, setLivePartial] = useState<{
     speaker: 'panelist' | 'candidate';
     text: string;
@@ -98,6 +100,16 @@ export default function BoardroomPage() {
 
   // Webcam Posture Snapshots
   const [webcamSnapshots, setWebcamSnapshots] = useState<string[]>([]);
+  const webcamSnapshotsRef = useRef<string[]>([]);
+  const profileRef = useRef<CandidateProfile>(profile);
+
+  useEffect(() => {
+    profileRef.current = profile;
+  }, [profile]);
+
+  useEffect(() => {
+    webcamSnapshotsRef.current = webcamSnapshots;
+  }, [webcamSnapshots]);
 
   // Session Timer
   const [sessionSeconds, setSessionSeconds] = useState<number>(0);
@@ -184,6 +196,14 @@ export default function BoardroomPage() {
   const startInterview = async () => {
     setErrorMessage(null);
     setStatus('connecting');
+    setTranscript([]);
+    transcriptRef.current = [];
+    setLivePartial(null);
+
+    if (typeof window !== 'undefined') {
+      sessionStorage.removeItem('ibps_evaluation_report');
+      sessionStorage.removeItem('ibps_transcript');
+    }
 
     try {
       const customKey =
@@ -287,11 +307,13 @@ export default function BoardroomPage() {
             }
           },
           onTranscriptUpdate: (entries, partial) => {
-            setTranscript([...entries]);
+            const copy = [...entries];
+            transcriptRef.current = copy;
+            setTranscript(copy);
             setLivePartial(partial || null);
           },
           onInterviewComplete: () => {
-            endInterview();
+            void endInterview();
           },
           onError: (err) => {
             console.error('Gemini Live Board Error:', err);
@@ -300,6 +322,7 @@ export default function BoardroomPage() {
         },
       });
 
+      controllerRef.current = ctrl;
       setController(ctrl);
       await ctrl.start();
     } catch (err: unknown) {
@@ -348,21 +371,24 @@ export default function BoardroomPage() {
 
   // 10. End & Generate Scorecard
   const endInterview = useCallback(async () => {
-    let finalTranscript = transcript;
-    if (controller) {
-      finalTranscript = controller.getTranscript();
-      await controller.disconnect();
+    const activeCtrl = controllerRef.current;
+    let finalTranscript = transcriptRef.current;
+    if (activeCtrl) {
+      finalTranscript = activeCtrl.getTranscript();
+      await activeCtrl.disconnect();
+      controllerRef.current = null;
       setController(null);
     }
 
     if (typeof window !== 'undefined') {
+      sessionStorage.removeItem('ibps_evaluation_report');
       sessionStorage.setItem('ibps_transcript', JSON.stringify(finalTranscript));
-      sessionStorage.setItem('ibps_webcam_snapshots', JSON.stringify(webcamSnapshots));
-      sessionStorage.setItem('ibps_candidate_profile', JSON.stringify(profile));
+      sessionStorage.setItem('ibps_webcam_snapshots', JSON.stringify(webcamSnapshotsRef.current));
+      sessionStorage.setItem('ibps_candidate_profile', JSON.stringify(profileRef.current));
     }
 
     router.push('/report');
-  }, [controller, transcript, webcamSnapshots, profile, router]);
+  }, [router]);
 
   const activePanelist = PANELISTS_BY_SEAT[activeSeat] || PANELISTS[0];
   const otherPanelists = PANELISTS.filter((p) => p.seat !== activeSeat);

@@ -12,54 +12,9 @@ import { ScorecardView } from '@/components/ScorecardView';
 import { recordCompletedRoundQuestions } from '@/lib/question-memory';
 import { Loader2, AlertCircle, Camera } from 'lucide-react';
 
-// Fallback transcript if someone visits /report directly
-const DEFAULT_TRANSCRIPT: TranscriptEntry[] = [
-  {
-    id: 't-1',
-    speaker: 'panelist',
-    seat: 1,
-    speakerName: 'Shri R.K. Deshmukh (Chairman)',
-    text: 'Good morning, please make yourself comfortable. To begin with, tell us about yourself and why a graduate like you wants to pursue public sector banking.',
-    timestamp: Date.now() - 300000,
-  },
-  {
-    id: 't-2',
-    speaker: 'candidate',
-    speakerName: 'Aarav Sharma',
-    text: 'Good morning respected Chairman and board members. Having graduated in computer science, I observed how digital public infrastructure like UPI and CBDC has transformed rural banking. A PO role allows me to combine technological acumen with direct financial inclusion.',
-    timestamp: Date.now() - 240000,
-  },
-  {
-    id: 't-3',
-    speaker: 'panelist',
-    seat: 2,
-    speakerName: 'Shri S. Narayanan (RBI Nominee)',
-    text: 'Can you specify the current Repo Rate and explain how an increase in Repo impacts bank lending rates and retail inflation?',
-    timestamp: Date.now() - 180000,
-  },
-  {
-    id: 't-4',
-    speaker: 'candidate',
-    speakerName: 'Aarav Sharma',
-    text: 'Sir, the Policy Repo Rate is 6.50%. When RBI increases Repo, borrowing becomes costlier for commercial banks. Banks consequently raise their benchmark EBLR and MCLR lending rates, cooling credit growth and moderating demand-pull inflation.',
-    timestamp: Date.now() - 120000,
-  },
-  {
-    id: 't-5',
-    speaker: 'panelist',
-    seat: 4,
-    speakerName: 'Shri Rajeshwar Rao (CGM Rural)',
-    text: 'Agar aapki posting ek remote rural branch mein hoti hai jahan kisan bhai KCC subsidy ke delay par aakar gussa hote hain, aap unhe kaise handle karenge?',
-    timestamp: Date.now() - 60000,
-  },
-  {
-    id: 't-6',
-    speaker: 'candidate',
-    speakerName: 'Aarav Sharma',
-    text: 'Sir, sabse pehle main unhe aadar se baithaunga aur unki baat poori shanti se sununga. Kisan bhaiyon ke liye samay par loan milna bohot zaroori hota hai. Portal par DBT status check karke unhe sach bataunga aur Lead Bank ya district agriculture officer se coordinate karke turant hal nikalunga.',
-    timestamp: Date.now() - 10000,
-  },
-];
+function buildTranscriptSignature(entries: TranscriptEntry[]): string {
+  return entries.map((t) => `${t.id}:${t.speaker}:${t.text.length}`).join('|');
+}
 
 const LOADING_STEPS = [
   'Convening the 4-Member IBPS Interview Board...',
@@ -74,9 +29,10 @@ export default function ReportPage() {
   const router = useRouter();
 
   const [profile, setProfile] = useState<CandidateProfile>(SAMPLE_PROFILES[0]);
-  const [transcript, setTranscript] = useState<TranscriptEntry[]>(DEFAULT_TRANSCRIPT);
+  const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
   const [webcamSnapshots, setWebcamSnapshots] = useState<string[]>([]);
   const [report, setReport] = useState<EvaluationReport | null>(null);
+  const [isEmptySession, setIsEmptySession] = useState<boolean>(false);
 
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [loadingStepIdx, setLoadingStepIdx] = useState<number>(0);
@@ -97,6 +53,13 @@ export default function ReportPage() {
       interviewTranscript: TranscriptEntry[],
       snapshots: string[]
     ) => {
+      if (!interviewTranscript || interviewTranscript.length === 0) {
+        setIsEmptySession(true);
+        setIsLoading(false);
+        return;
+      }
+
+      setIsEmptySession(false);
       setIsLoading(true);
       setErrorMessage(null);
 
@@ -134,9 +97,13 @@ export default function ReportPage() {
         const resolvedReport: EvaluationReport = data.report || data;
         setReport(resolvedReport);
 
-        // Cache report in sessionStorage
+        // Cache report in sessionStorage bound to this exact transcript signature
         if (typeof window !== 'undefined') {
-          sessionStorage.setItem('ibps_evaluation_report', JSON.stringify(resolvedReport));
+          const transcriptSignature = buildTranscriptSignature(interviewTranscript);
+          sessionStorage.setItem(
+            'ibps_evaluation_report',
+            JSON.stringify({ transcriptSignature, report: resolvedReport })
+          );
         }
       } catch (err: unknown) {
         const error = err instanceof Error ? err : new Error(String(err));
@@ -154,7 +121,7 @@ export default function ReportPage() {
     if (typeof window === 'undefined') return;
 
     let prof = SAMPLE_PROFILES[0];
-    let trans = DEFAULT_TRANSCRIPT;
+    let trans: TranscriptEntry[] = [];
     let snaps: string[] = [];
 
     try {
@@ -179,13 +146,25 @@ export default function ReportPage() {
         setWebcamSnapshots(snaps);
       }
 
-      // Check if report already exists in sessionStorage
+      if (trans.length === 0) {
+        setIsEmptySession(true);
+        setIsLoading(false);
+        return;
+      }
+
+      // Only reuse cached report if its transcript signature matches this exact transcript
+      const currentSignature = buildTranscriptSignature(trans);
       const cachedReport = sessionStorage.getItem('ibps_evaluation_report');
       if (cachedReport) {
         try {
           const parsedRaw = JSON.parse(cachedReport);
+          const cachedSig = parsedRaw?.transcriptSignature;
           const parsedReport: EvaluationReport = parsedRaw?.report || parsedRaw;
-          if (parsedReport && parsedReport.categoryScores) {
+          if (
+            cachedSig === currentSignature &&
+            parsedReport &&
+            parsedReport.categoryScores
+          ) {
             setReport(parsedReport);
             setIsLoading(false);
             return;
@@ -196,7 +175,7 @@ export default function ReportPage() {
       console.warn('Error reading from sessionStorage:', err);
     }
 
-    // Trigger evaluation
+    // Trigger fresh evaluation for this transcript
     runEvaluation(prof, trans, snaps);
   }, [runEvaluation]);
 
@@ -306,8 +285,44 @@ export default function ReportPage() {
         </div>
       )}
 
+      {/* Empty Session Screen */}
+      {!isLoading && isEmptySession && !report && (
+        <div className="min-h-screen flex flex-col items-center justify-center p-6 text-center">
+          <div className="max-w-md w-full p-8 rounded-2xl bg-zinc-900 border border-white/[0.08] shadow-2xl space-y-6">
+            <div className="w-12 h-12 mx-auto rounded-full border border-zinc-700 bg-zinc-950 flex items-center justify-center">
+              <AlertCircle className="w-6 h-6 text-amber-400" strokeWidth={1.5} />
+            </div>
+            <div className="space-y-2">
+              <h2 className="text-sm font-semibold uppercase tracking-wider font-mono text-zinc-100">
+                No Interview Transcript Recorded
+              </h2>
+              <p className="text-xs text-zinc-400 leading-relaxed">
+                Start and complete a live interview session in the boardroom before generating an official IBPS evaluation scorecard.
+              </p>
+            </div>
+
+            <div className="flex gap-2.5 pt-2">
+              <button
+                type="button"
+                onClick={() => router.push('/room')}
+                className="flex-1 py-2.5 px-4 rounded-lg bg-[#E5B869] hover:bg-[#ecd094] text-zinc-950 font-semibold text-xs transition-colors cursor-pointer"
+              >
+                Return to Interview Room
+              </button>
+              <button
+                type="button"
+                onClick={() => router.push('/')}
+                className="py-2.5 px-4 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-300 text-xs font-mono transition-colors cursor-pointer"
+              >
+                Home
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Error Screen with Retry */}
-      {!isLoading && errorMessage && !report && (
+      {!isLoading && !isEmptySession && errorMessage && !report && (
         <div className="min-h-screen flex flex-col items-center justify-center p-6 text-center">
           <div className="max-w-md w-full p-8 rounded-2xl bg-zinc-900 border border-white/[0.08] shadow-2xl space-y-6">
             <div className="w-12 h-12 mx-auto rounded-full border border-red-800/60 bg-red-950/30 flex items-center justify-center">

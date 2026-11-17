@@ -160,6 +160,7 @@ export class PanelBoardLiveController {
   private transcript: TranscriptEntry[] = [];
   private currentPanelistChunkText: string = '';
   private currentCandidateChunkText: string = '';
+  private latestInterimCandidateText: string = '';
   private finishTurnWatchdogTimer: ReturnType<typeof setTimeout> | null = null;
   private hybridVadFallbackTimer: ReturnType<typeof setTimeout> | null = null;
   private isDestroyed = false;
@@ -280,6 +281,8 @@ export class PanelBoardLiveController {
     this.clearPendingHandoffTimer();
     this.clearFinishTurnWatchdog();
     this.clearHybridVadFallbackTimer();
+    this.flushPanelistTranscript();
+    this.flushCandidateTranscript();
 
     // Close Gemini Live session
     if (this.activeSession) {
@@ -375,6 +378,7 @@ export class PanelBoardLiveController {
     this.clearFinishTurnWatchdog();
     this.clearHybridVadFallbackTimer();
     this.currentCandidateChunkText = '';
+    this.latestInterimCandidateText = '';
     this.hasCandidateVoiceActivityInTurn = false;
     this.consecutiveShortFillerAutoNudges = 0;
     this.pendingAutoContinuationReason = null;
@@ -451,8 +455,8 @@ export class PanelBoardLiveController {
     this.clearHybridVadFallbackTimer();
     playDoneSpeakingPop();
 
-    // 1. Capture any accumulated candidate transcription
-    const spoken = this.currentCandidateChunkText.trim();
+    // 1. Capture any accumulated candidate transcription (including interim text)
+    const spoken = (this.currentCandidateChunkText + this.latestInterimCandidateText).trim();
     const candidateSpoke = spoken.length > 0 || this.hasCandidateVoiceActivityInTurn;
     this.flushCandidateTranscript();
 
@@ -477,8 +481,14 @@ export class PanelBoardLiveController {
         ) {
           return;
         }
-        const promptText = spoken
-          ? `[Candidate finished answering: "${spoken}"]`
+        // Flush any late-arriving transcription chunks from the 1200ms Hybrid VAD window
+        const lateSpoken = (
+          this.currentCandidateChunkText + this.latestInterimCandidateText
+        ).trim();
+        this.flushCandidateTranscript();
+        const combinedSpoken = lateSpoken || spoken;
+        const promptText = combinedSpoken
+          ? `[Candidate finished answering: "${combinedSpoken}"]`
           : '[Candidate has finished speaking. Please respond to their answer and ask your next question.]';
         this.sendClientTurnText(promptText);
       }, 1200);
@@ -504,6 +514,8 @@ export class PanelBoardLiveController {
   }
 
   public getTranscript(): TranscriptEntry[] {
+    this.flushPanelistTranscript();
+    this.flushCandidateTranscript();
     return [...this.transcript];
   }
 
@@ -1089,7 +1101,8 @@ export class PanelBoardLiveController {
 
       // 4. Candidate Speech Transcription (Input audio transcription)
       if (content.interimInputTranscription?.text) {
-        const liveText = (this.currentCandidateChunkText + content.interimInputTranscription.text).trim();
+        this.latestInterimCandidateText = content.interimInputTranscription.text;
+        const liveText = (this.currentCandidateChunkText + this.latestInterimCandidateText).trim();
         this.callbacks.onTranscriptUpdate?.(this.transcript, {
           speaker: 'candidate',
           text: liveText,
@@ -1099,6 +1112,7 @@ export class PanelBoardLiveController {
       if (content.inputTranscription?.text) {
         // Accumulate candidate transcription chunks into the full growing sentence
         this.currentCandidateChunkText += content.inputTranscription.text;
+        this.latestInterimCandidateText = '';
         const liveText = this.currentCandidateChunkText.trim();
         if (liveText) {
           this.callbacks.onTranscriptUpdate?.(this.transcript, {
@@ -1389,16 +1403,7 @@ export class PanelBoardLiveController {
     this.stopPlaybackQueue();
 
     this.flushCandidateTranscript();
-    if (this.currentPanelistChunkText.trim()) {
-      const panelist = PANELISTS_BY_SEAT[this.activeSeat];
-      this.addTranscriptEntry({
-        speaker: 'panelist',
-        seat: this.activeSeat,
-        speakerName: panelist.name,
-        text: this.currentPanelistChunkText.trim(),
-      });
-      this.currentPanelistChunkText = '';
-    }
+    this.flushPanelistTranscript();
 
     this.activeSession = null;
     this.isModelGenerating = false;
@@ -1455,20 +1460,9 @@ export class PanelBoardLiveController {
     this.setStatus('switching');
     playHandoffTick();
 
-    // Finalize any candidate speech chunk if pending
+    // Finalize any candidate or panelist speech chunk if pending
     this.flushCandidateTranscript();
-
-    // Finalize any leftover transcription text from previous seat
-    if (this.currentPanelistChunkText.trim()) {
-      const panelist = PANELISTS_BY_SEAT[this.activeSeat];
-      this.addTranscriptEntry({
-        speaker: 'panelist',
-        seat: this.activeSeat,
-        speakerName: panelist.name,
-        text: this.currentPanelistChunkText.trim(),
-      });
-      this.currentPanelistChunkText = '';
-    }
+    this.flushPanelistTranscript();
 
     // Add a system announcement to transcript
     const nextPanelist = PANELISTS_BY_SEAT[targetSeat];
@@ -1508,17 +1502,7 @@ export class PanelBoardLiveController {
     this.clearFinishTurnWatchdog();
     this.clearHybridVadFallbackTimer();
     this.flushCandidateTranscript();
-
-    if (this.currentPanelistChunkText.trim()) {
-      const panelist = PANELISTS_BY_SEAT[this.activeSeat];
-      this.addTranscriptEntry({
-        speaker: 'panelist',
-        seat: this.activeSeat,
-        speakerName: panelist.name,
-        text: this.currentPanelistChunkText.trim(),
-      });
-      this.currentPanelistChunkText = '';
-    }
+    this.flushPanelistTranscript();
 
     this.addTranscriptEntry({
       speaker: 'system',
@@ -1532,16 +1516,31 @@ export class PanelBoardLiveController {
     this.callbacks.onInterviewComplete?.(summary);
   }
 
+  private flushPanelistTranscript(): void {
+    const text = this.currentPanelistChunkText.trim();
+    if (text) {
+      const panelist = PANELISTS_BY_SEAT[this.activeSeat];
+      this.addTranscriptEntry({
+        speaker: 'panelist',
+        seat: this.activeSeat,
+        speakerName: panelist.name,
+        text,
+      });
+      this.currentPanelistChunkText = '';
+    }
+  }
+
   private flushCandidateTranscript(): void {
-    const text = this.currentCandidateChunkText.trim();
+    const text = (this.currentCandidateChunkText + this.latestInterimCandidateText).trim();
     if (text) {
       this.addTranscriptEntry({
         speaker: 'candidate',
         speakerName: this.profile.name,
         text,
       });
-      this.currentCandidateChunkText = '';
     }
+    this.currentCandidateChunkText = '';
+    this.latestInterimCandidateText = '';
   }
 
   private clearFinishTurnWatchdog(): void {

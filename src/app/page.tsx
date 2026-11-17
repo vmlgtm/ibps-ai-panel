@@ -169,7 +169,10 @@ export default function HomePage() {
       setIsPreparing(true);
       setPreparationStep('Saving candidate profile...');
 
-      // 1. Store profile in sessionStorage
+      // 1. Clear stale interview/report data and store fresh candidate profile in sessionStorage
+      sessionStorage.removeItem('ibps_evaluation_report');
+      sessionStorage.removeItem('ibps_transcript');
+      sessionStorage.removeItem('ibps_webcam_snapshots');
       sessionStorage.setItem('ibps_candidate_profile', JSON.stringify(profile));
 
       setPreparationStep('Panelists reviewing profile & generating dossier...');
